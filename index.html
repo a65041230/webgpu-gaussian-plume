@@ -110,6 +110,21 @@ struct Atmo {
 @group(0) @binding(3) var sNear: sampler; // @nonfiltering
 @group(0) @binding(4) var<uniform> A: Atmo;
 @group(0) @binding(5) var sShadow: sampler_comparison;
+// 煙流（3D 外觀）參數。中心線高度與粗細來自 plumeLUT（JS 的物理模組算好寫入）
+struct PlumeU {
+  wind: vec4f,             // xy＝下風方向 (x,z) 單位向量，z＝平流風速 [m/s]，w＝往下風畫到多遠 [m]
+  src: array<vec4f, 3>,    // xyz＝煙囪口世界座標，w＝混合比例係數（f_peak = w / (σy·σz)）
+  prm: vec4f,              // x＝LUT 涵蓋的最遠距離，y＝垂直蜿蜒／水平蜿蜒的比例，z＝水平蜿蜒波長，w＝氣膠霾消光係數（f=1 時）[1/m]
+  prm2: vec4f,             // x＝混合層高度（0＝沒有逆溫層），y＝光學深度體積沿光線方向一格的長度，z＝垂直蜿蜒波長，w＝出口半徑
+  lv0: vec4f,              // 光空間體積：世界座標 → uvw 的三列（xyz·p + w）
+  lv1: vec4f,
+  lv2: vec4f,
+  obbMin: vec4f,           // 煙流外框（煙流座標：x 下風、y 高度、z 橫風），w＝原點世界 x
+  obbMax: vec4f,           // w＝原點世界 z
+  flare: vec4f,            // 火炬位置 xyz，w＝強度
+  glow: vec4f,             // rgb＝夜間廠區燈光往上照的顏色（照亮煙流底部），w 預留
+};
+@group(0) @binding(6) var<uniform> PL: PlumeU;
 
 const PI: f32 = 3.14159265358979;
 const TAU: f32 = 6.28318530717959;
@@ -423,7 +438,7 @@ fn skyUv(dir: vec3f) -> vec2f {
 <script type="text/wgsl" id="scene_tex">
 // ── scene_tex：場景共用貼圖（group 1）。產生這些貼圖的 pass 不能 include 這個模組 ──
 @group(1) @binding(0) var transLUT: texture_2d<f32>;
-@group(1) @binding(1) var msLUT: texture_2d<f32>;
+@group(1) @binding(1) var lightVol: texture_3d<f32>;
 @group(1) @binding(2) var skyLUT: texture_2d<f32>;
 @group(1) @binding(3) var ambCube: texture_2d<f32>;
 @group(1) @binding(4) var noise2D: texture_2d<f32>;
@@ -431,6 +446,186 @@ fn skyUv(dir: vec3f) -> vec2f {
 @group(1) @binding(6) var normalTex: texture_2d<f32>;
 @group(1) @binding(7) var macroTex: texture_2d<f32>;
 @group(1) @binding(8) var shadowMap: texture_depth_2d_array;
+</script>
+
+<script type="text/wgsl" id="noise3d_gen">
+// ── noise3d_gen：啟動時用 compute 產生可平鋪的 3D 雜訊（64³，rgba8）──
+//    R＝Perlin-Worley（大團塊）、G＝Worley FBM（中）、B＝Worley FBM（細）、A＝Perlin FBM
+@group(0) @binding(0) var outTex: texture_storage_3d<rgba8unorm, write>;
+const N3: i32 = 64;
+fn h3(p: vec3i) -> vec3f {
+  var x = u32(p.x) * 1664525u + 1013904223u;
+  x = (x ^ (u32(p.y) * 2246822519u)) * 3266489917u;
+  x = (x ^ (u32(p.z) * 668265263u)) * 2654435761u;
+  x ^= x >> 15u; x *= 2246822519u; x ^= x >> 13u;
+  let a = x; let b = a * 1103515245u + 12345u; let c = b * 1103515245u + 12345u;
+  return vec3f(f32(a >> 8u), f32(b >> 8u), f32(c >> 8u)) / 16777216.0;
+}
+fn wrap(p: vec3i, per: i32) -> vec3i { return ((p % per) + per) % per; }
+fn worley(p: vec3f, cells: i32) -> f32 {
+  let q = p * f32(cells);
+  let ip = vec3i(floor(q));
+  var md = 9.0;
+  for (var z = -1; z <= 1; z++) { for (var y = -1; y <= 1; y++) { for (var x = -1; x <= 1; x++) {
+    let c = ip + vec3i(x, y, z);
+    let fp = vec3f(c) + h3(wrap(c, cells) + vec3i(cells * 7));
+    md = min(md, distance(q, fp));
+  } } }
+  return saturate(1.0 - md);
+}
+fn perlin(p: vec3f, per: i32) -> f32 {
+  let q = p * f32(per);
+  let ip = vec3i(floor(q));
+  let f = q - floor(q);
+  let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  var acc = 0.0;
+  for (var k = 0; k < 8; k++) {
+    let o = vec3i(k & 1, (k >> 1u) & 1, (k >> 2u) & 1);
+    let g = normalize(h3(wrap(ip + o, per) + vec3i(per * 13)) * 2.0 - 1.0);
+    let w = mix(1.0 - u.x, u.x, f32(o.x)) * mix(1.0 - u.y, u.y, f32(o.y)) * mix(1.0 - u.z, u.z, f32(o.z));
+    acc += w * dot(g, f - vec3f(o));
+  }
+  return acc;
+}
+@compute @workgroup_size(4, 4, 4) fn main(@builtin(global_invocation_id) id: vec3u) {
+  let p = (vec3f(id) + 0.5) / f32(N3);
+  let pf = perlin(p, 4) * 0.55 + perlin(p, 8) * 0.28 + perlin(p, 16) * 0.17;
+  let w1 = worley(p, 4) * 0.60 + worley(p, 8) * 0.27 + worley(p, 16) * 0.13;
+  let w2 = worley(p, 8) * 0.60 + worley(p, 16) * 0.27 + worley(p, 32) * 0.13;
+  let w3 = worley(p, 16) * 0.65 + worley(p, 32) * 0.35;
+  let pw = saturate((pf * 1.1 + 0.5) * 0.55 + w1 * 0.75 - 0.18);
+  textureStore(outTex, vec3i(id), vec4f(pw, w2, w3, saturate(pf * 1.2 + 0.5)));
+}
+</script>
+
+<script type="text/wgsl" id="plume_fn">
+// ── plume_fn：3D 煙流的密度。需要先宣告 plumeLUT、condLUT、noise3D ──
+// 每支煙囪：中心線高度 Δh(x) 與瞬時粗細 σy、σz 查 plumeLUT（和分析模式同一套 Briggs 模型算出）；
+// 混合比例 f（煙氣佔的比例）＝ 高斯包絡 × 湍流雜訊；f 查 condLUT 得到凝結水滴的消光係數。
+// f 低於臨界值時水滴蒸發（白煙消失），但污染物還在 —— 只剩很淡的氣膠霾。
+// 水滴消光、霾消光 [1/m]、到煙流外緣的估計距離、(z−中心)/σz、σz、(y−中心)/σy、建議的 raymarch 步長
+struct PD { ext: f32, haze: f32, sdf: f32, dzn: f32, sz: f32, dyn: f32, stp: f32, ao: f32 };   // ao＝團塊凹處的遮蔽
+fn condBeta(f: f32) -> f32 {
+  let t = 1.0 + log2(max(f, 1e-6)) / 12.0;
+  if (t <= 0.0) { return 0.0; }
+  return textureSampleLevel(condLUT, sLin, vec2f(min(t, 1.0) * (255.0 / 256.0) + 0.5 / 256.0, 0.5), 0.0).r;
+}
+fn plumeEval(p: vec3f, lod: f32) -> PD {
+  var o: PD;
+  o.ext = 0.0; o.haze = 0.0; o.sdf = 1e5; o.dzn = 0.0; o.sz = 0.0; o.dyn = 0.0; o.ao = 0.0;
+  let wd = PL.wind.xy;
+  let r0 = PL.prm2.w;
+  let ky = TAU / PL.prm.z;
+  let kz = TAU / PL.prm2.z;
+  var wsum = 0.0;
+  var stepIn = 1e5;
+  var sNear = 0.0;
+  for (var i = 0; i < 3; i++) {
+    let s = PL.src[i];
+    let rel = p - s.xyz;
+    let x = dot(rel.xz, wd);
+    // 上風側：到煙囪口的距離（不能用到「上風平面」的距離，否則貼著平面走的視線會一直走小步）
+    if (x < -3.0 * r0) { o.sdf = min(o.sdf, max(length(rel) - 5.0 * r0, 2.0)); continue; }
+    if (x > PL.wind.w) { o.sdf = min(o.sdf, x - PL.wind.w + 2.0); continue; }
+    let y = rel.z * wd.x - rel.x * wd.y;
+    let t = sqrt(max(x, 0.0) / PL.prm.x);
+    let lut = textureSampleLevel(plumeLUT, sLin, vec2f(t * (511.0 / 512.0) + 0.5 / 512.0, (f32(i) + 0.5) / 4.0), 0.0);
+    // 蜿蜒：隨氣塊平流（ξ = x − u·t），時間平均後會回到高斯包絡
+    let xi = x - PL.wind.z * F.time.x + f32(i) * 733.0;
+    let my = lut.a * 1.84 * (0.62 * sin(ky * xi) + 0.38 * sin(2.37 * ky * xi + 1.3) + 0.25 * sin(5.3 * ky * xi + 4.1));
+    let mz = lut.a * PL.prm.y * 1.84 * (0.62 * sin(kz * xi + 2.0) + 0.38 * sin(2.11 * kz * xi + 0.4) + 0.25 * sin(4.7 * kz * xi + 5.2));
+    let dy = y - my;
+    let dz = rel.y - lut.r - mz;
+    let smin = min(lut.g, lut.b);
+    let d = sqrt(dy * dy / (lut.g * lut.g) + dz * dz / (lut.b * lut.b));
+    let sd = (d - 4.2) * smin;
+    if (sd < o.sdf) { o.sdf = sd; sNear = smin; }
+    if (d > 4.2) { continue; }
+    stepIn = min(stepIn, 0.33 * smin);
+    // 湍流雜訊附著在氣塊上；團塊大小跟著煙流粗細走（相鄰兩個八度交叉淡化，避免尺度跳變）
+    let q = vec3f(xi, dy, dz);
+    let lam = clamp(3.2 * smin, 6.0, 3000.0);
+    let kf = log2(lam / 6.0);
+    let k0 = floor(kf);
+    let wk = kf - k0;
+    let l0 = 6.0 * exp2(k0);
+    let ev = vec3f(0.07, 0.31, 0.19) * (F.time.x * 0.9);
+    // 注意：兩層的取樣座標只差一個 2 倍縮放，這樣 kf 跨過整數時（wk 由 1 跳回 0、l0 加倍）雜訊場才完全連續
+    let n0 = textureSampleLevel(noise3D, sRep, (q + ev) / (l0 * 4.0), 0.0);
+    let n1 = textureSampleLevel(noise3D, sRep, (q + ev) / (l0 * 8.0), 0.0);
+    let nn = mix(n0, n1, wk);
+    let shape = nn.r;                                    // 大團塊（Perlin-Worley）
+    let far = smoothstep(300.0, 1800.0, x);              // 遠處已經混合均勻，團塊感要淡掉
+    let pulse = mix(0.70 + 0.60 * nn.a, 1.0, far);       // 粗細沿軸向起伏 → 一團一團的
+    var dn = d / pulse + (0.5 - shape) * mix(2.1, 0.2, far) + ((0.5 - nn.g) * 0.9 + (0.5 - nn.b) * 0.5) * lod * (1.0 - far);
+    dn = max(dn, d * 0.62);                              // 雜訊最多把邊緣往外推到一定程度，外框（d=4.2）處密度才會趨近 0
+    // 外框（d=4.2）處平滑收到 0：高斯尾巴被硬切的話，從切線方向看會在天空畫出細線
+    let g = exp(-0.5 * dn * dn) * smoothstep(-3.0 * r0, -0.5 * r0, x) * smoothstep(4.2, 2.8, d);
+    let f = min(s.w / (lut.g * lut.b) * g, 1.0);
+    let e = condBeta(f);
+    let hz = PL.prm.w * min(f, 0.03);                    // 氣膠霾：稀釋後才看得出來；靠近煙囪處由水滴主導
+    o.ext += e;
+    o.haze += hz;
+    let wgt = e + hz + 1e-7;
+    o.dzn += wgt * dz / lut.b;
+    o.dyn += wgt * dy / lut.g;
+    o.sz += wgt * lut.b;
+    o.ao += wgt * mix(mix(0.45, 1.0, smoothstep(0.25, 0.70, shape)), 1.0, far);
+    wsum += wgt;
+  }
+  if (wsum > 0.0) { o.dzn /= wsum; o.dyn /= wsum; o.sz /= wsum; o.ao /= wsum; } else { o.sz = 10.0; o.ao = 1.0; }
+  // 步長：在煙流外，往外緣走 0.6 倍的估計距離（煙流往下風會變粗，不能走滿）；在煙流內，用局部粗細的 1/3
+  // 下限是局部粗細的 1/4：視線擦過外框時估計距離趨近 0，沒有下限會一直走小步、把步數耗盡
+  o.stp = max(max(o.sdf, 0.0) * 0.6, 0.25 * sNear);
+  if (stepIn < 1e4) { o.stp = stepIn; }
+  return o;
+}
+</script>
+
+<script type="text/wgsl" id="plume_tau">
+// ── plume_tau：某一點往太陽方向、被煙流擋掉的光學深度（查光空間體積；體積外＝0）。需要 scene_tex ──
+fn plumeTau(p: vec3f) -> f32 {
+  let uvw = vec3f(dot(PL.lv0.xyz, p) + PL.lv0.w, dot(PL.lv1.xyz, p) + PL.lv1.w, dot(PL.lv2.xyz, p) + PL.lv2.w);
+  if (uvw.x < 0.0 || uvw.x > 1.0 || uvw.y < 0.0 || uvw.y > 1.0 || uvw.z < 0.0) { return 0.0; }
+  let e = min(min(uvw.x, 1.0 - uvw.x), min(uvw.y, 1.0 - uvw.y));
+  return textureSampleLevel(lightVol, sLin, vec3f(uvw.xy, min(uvw.z, 1.0)), 0.0).r * smoothstep(0.0, 0.03, e);
+}
+// 煙流投下的影子（給地面、建築、霧用）：回傳透光比例。
+// 太陽有視直徑，離煙流越遠半影越寬，影子逐漸淡掉（幾百公尺外就看不出細長的影子）
+fn plumeShadow(p: vec3f) -> f32 {
+  let wz = dot(PL.lv2.xyz, p) + PL.lv2.w;
+  if (wz < 0.0) { return 1.0; }
+  let beyond = max(wz - 1.0, 0.0) / length(PL.lv2.xyz);
+  return mix(exp(-plumeTau(p)), 1.0, 1.0 - exp(-beyond / 260.0));
+}
+</script>
+
+<script type="text/wgsl" id="lightvol">
+// ── lightvol：煙流的光學深度體積（compute）。沿光線方向累積消光，
+//    一張體積同時給：煙流自陰影、落在地面與建築的影子、霧裡的光柱 ──
+#include common
+@group(1) @binding(0) var plumeLUT: texture_2d<f32>;
+@group(1) @binding(1) var condLUT: texture_2d<f32>;
+@group(1) @binding(2) var noise3D: texture_3d<f32>;
+@group(1) @binding(3) var lvOut: texture_storage_3d<rgba16float, write>;
+struct LVU { o: vec4f, u: vec4f, v: vec4f, w: vec4f };   // 體積原點與三個軸（世界座標，長度＝整個範圍）
+@group(1) @binding(4) var<uniform> LV: LVU;
+#include plume_fn
+@compute @workgroup_size(8, 8, 1) fn main(@builtin(global_invocation_id) id: vec3u) {
+  let dim = textureDimensions(lvOut);
+  if (id.x >= dim.x || id.y >= dim.y) { return; }
+  let uv = (vec2f(id.xy) + 0.5) / vec2f(dim.xy);
+  let base = LV.o.xyz + LV.u.xyz * uv.x + LV.v.xyz * uv.y;
+  let dw = length(LV.w.xyz) / f32(dim.z);
+  var tau = 0.0;
+  for (var k = 0u; k < dim.z; k++) {
+    let p = base + LV.w.xyz * ((f32(k) + 0.5) / f32(dim.z));
+    let pd = plumeEval(p, 0.5);
+    let e = (pd.ext + pd.haze) * dw;
+    textureStore(lvOut, vec3i(vec2i(id.xy), i32(k)), vec4f(tau + 0.5 * e, 0.0, 0.0, 1.0));
+    tau += e;
+  }
+}
 </script>
 
 <script type="text/wgsl" id="sky_fn">
@@ -604,8 +799,23 @@ fn terrainH(xz: vec2f, mip: i32) -> f32 {
 <script type="text/wgsl" id="lighting">
 // ── lighting：不透明表面的光照（太陽＋天空環境光）。需要 sky_fn ──
 struct Surf { pos: vec3f, n: vec3f, albedo: vec3f, rough: f32, metal: f32, ao: f32, emis: vec3f };
-// 太陽陰影：cascaded shadow maps＋旋轉 Poisson 取樣的 PCF（SHADOW_TAPS 由畫質等級決定）
-fn sunShadow(pos: vec3f, n: vec3f) -> f32 {
+#include plume_tau
+// 給霧用的單點陰影查詢（不做濾波）
+fn csm1(pos: vec3f) -> f32 {
+  let nc = i32(F.shadowPrm.x);
+  let vd = dot(pos - F.camPos.xyz, F.camFwd.xyz);
+  var ci = nc;
+  for (var i = nc - 1; i >= 0; i--) { if (vd < F.shadowSplit[i]) { ci = i; } }
+  if (ci >= nc) { return 1.0; }
+  let sp = F.shadowVP[ci] * vec4f(pos, 1.0);
+  let uv = sp.xy * vec2f(0.5, -0.5) + 0.5;
+  if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) { return 1.0; }
+  return textureSampleCompareLevel(shadowMap, sShadow, uv, ci, sp.z);
+}
+// 太陽陰影＝cascaded shadow maps × 煙流的遮蔽
+fn sunShadow(pos: vec3f, n: vec3f) -> f32 { return csmShadow(pos, n) * plumeShadow(pos); }
+// cascaded shadow maps＋旋轉 Poisson 取樣的 PCF（SHADOW_TAPS 由畫質等級決定）
+fn csmShadow(pos: vec3f, n: vec3f) -> f32 {
   let nc = i32(F.shadowPrm.x);
   let vd = dot(pos - F.camPos.xyz, F.camFwd.xyz);
   var ci = nc;
@@ -1013,6 +1223,222 @@ fn palette(h: f32) -> vec3f {                    // 貨櫃常見顏色
 }
 </script>
 
+<script type="text/wgsl" id="vol_march">
+// ── vol_march：低解析度的體積 raymarch。先走煙流（依到煙流外緣的距離調整步長），再走大氣霧；
+//    輸出 (加上的輻射, 透射率) 與輔助資訊 (重投影用的深度, 場景深度) ──
+#include common
+#include fullscreen
+#include atmo_fn
+#include scene_tex
+#include atmo_lut_fn
+#include sky_lut_map
+#include sky_fn
+#include lighting
+@group(2) @binding(0) var plumeLUT: texture_2d<f32>;
+@group(2) @binding(1) var condLUT: texture_2d<f32>;
+@group(2) @binding(2) var noise3D: texture_3d<f32>;
+@group(2) @binding(3) var msLUT: texture_2d<f32>;
+#if MSAA
+@group(2) @binding(4) var depthIn: texture_depth_multisampled_2d;
+#else
+@group(2) @binding(4) var depthIn: texture_depth_2d;
+#endif
+#include plume_fn
+struct MarchOut { @location(0) col: vec4f, @location(1) aux: vec4f };
+@fragment fn fs(in: FSOut) -> MarchOut {
+  let dpt = textureLoad(depthIn, vec2i(in.uv * F.viewport.xy), 0);
+  let rdu = viewRay(in.uv);
+  let rl = length(rdu);
+  let rd = rdu / rl;
+  let ro = F.camPos.xyz;
+  let isSky = dpt <= 0.0;
+  let zlin = min(linDepth(dpt), 60000.0);
+  let tScene = zlin * rl;
+  let jit = ign(in.pos.xy, F.time.y);
+  let sunL = F.sunDir.xyz;
+  let cosT = dot(rd, sunL);
+  let pixA = 2.0 * F.camUp.w * F.viewport.w * VOL_DIV;       // 一個低解析度像素的張角
+  // ── 煙流 ──
+  var Tp = 1.0;
+  var Lp = vec3f(0.0);
+  var tw = 0.0;
+  var twt = 0.0;
+  let wd = PL.wind.xy;
+  let relo = ro.xz - vec2f(PL.obbMin.w, PL.obbMax.w);
+  let rol = vec3f(dot(relo, wd), ro.y, relo.y * wd.x - relo.x * wd.y);
+  var rdl = vec3f(dot(rd.xz, wd), rd.y, rd.z * wd.x - rd.x * wd.y);
+  rdl = select(rdl, vec3f(1e-6), abs(rdl) < vec3f(1e-6));
+  let ta = (PL.obbMin.xyz - rol) / rdl;
+  let tb = (PL.obbMax.xyz - rol) / rdl;
+  let tmn = min(ta, tb);
+  let tmx = max(ta, tb);
+  let t0 = max(max(tmn.x, tmn.y), max(tmn.z, 0.0));
+  let t1 = min(min(tmx.x, tmx.y), min(tmx.z, tScene));
+  if (t1 > t0) {
+    let ambUp = ambient(vec3f(0.0, 1.0, 0.0));
+    let ambDn = ambient(vec3f(0.0, -1.0, 0.0)) + PL.glow.rgb;
+    var t = t0 + jit * max(2.0, t0 * pixA * 2.0);
+    for (var i = 0; i < VOL_STEPS; i++) {
+      if (t >= t1 || Tp < 0.004) { break; }
+      let p = ro + rd * t;
+      let dsMin = max(1.5, t * pixA * 1.2);
+      let pd = plumeEval(p, saturate(1.6 - t * pixA * 0.25));
+      let sig = pd.ext + pd.haze;
+      // 每一步的長度都加亂數（平均不變）：取樣位置才不會在相鄰像素之間排成等距的「等高線」
+      let xi = fract(jit + 0.754878 * f32(i + 1));
+      if (sig < 1e-7) { t += clamp(pd.stp, dsMin, 400.0) * (0.7 + 0.6 * xi); continue; }
+      let ds = clamp(min(pd.stp, 1.4 / sig), dsMin, 90.0) * (0.5 + xi);   // 步長不超過約 1.4 個平均自由徑
+      // 太陽光：查光學深度體積；多重散射用幾個「越來越鈍」的八度近似（厚的地方不會全黑）
+      // 體積裡存的是「到體素中心」的累積值，要扣掉取樣點自己這格的一半，迎光面才不會被自己遮暗
+      let tauS = max(plumeTau(p) - 0.5 * sig * PL.prm2.y, 0.0);
+      // 一次散射（雙瓣 HG：逆光時薄邊發亮）＋兩個較鈍的八度（近似低階多重散射）
+      var ms = 0.0;
+      var a = 1.0; var b = 1.0; var c = 1.0;
+      for (var k = 0; k < 3; k++) {
+        ms += b * exp(-tauS * a) * mix(hg(cosT, 0.86 * c), hg(cosT, -0.28 * c), 0.2);
+        a *= 0.45; b *= 0.6; c *= 0.45;
+      }
+      // 高階多重散射：光在厚雲裡擴散。雙流近似的漫透射率 1/(1+0.75(1−g)τ)，g≈0.85；
+      // 只有夠厚的地方才有（薄霧只有一次散射）
+      let thick = 1.0 - exp(-sig * pd.sz * 1.5);
+      ms += thick * 0.75 / PI / (1.0 + 0.075 * tauS);
+      ms *= pd.ao;
+      // 環境光：依取樣點在煙流截面裡的位置估計「朝外的方向」，查該方向的天空；越深入煙流越暗。
+      // 這樣背光那一側拿到的是另一邊天空的冷色，迎光側才是暖色
+      let nrmW = normalize(vec3f(-wd.y * pd.dyn, pd.dzn + 0.15, wd.x * pd.dyn) + vec3f(0.0, 1e-3, 0.0));
+      let depthIn = max(2.3 - length(vec2f(pd.dyn, pd.dzn)), 0.0);
+      let td = sig * pd.sz * clamp(1.25 + 0.9 * pd.dzn, 0.05, 3.0);
+      let amb = (ambient(nrmW) * exp(-sig * pd.sz * depthIn * 0.25) * 1.15 + (ambUp * 0.5 + ambDn) * 0.15) * pd.ao;
+      // 火炬：點光源，照亮煙流底部
+      let fv = PL.flare.xyz - p;
+      let fl = vec3f(1.0, 0.52, 0.20) * PL.flare.w / (dot(fv, fv) + 900.0) * exp(-td * 0.3);
+      let alb = (vec3f(pd.ext) + pd.haze * vec3f(0.93, 0.90, 0.86)) / sig;
+      let Lin = alb * (F.sunIllum.rgb * ms + amb + fl);
+      let sT = exp(-sig * ds);
+      Lp += Tp * (1.0 - sT) * Lin;
+      tw += Tp * (1.0 - sT);
+      twt += Tp * (1.0 - sT) * t;
+      Tp *= sT;
+      t += ds;
+    }
+  }
+  // ── 大氣霧（和天空 LUT 同一個介質）：太陽項會被煙流與建築擋住 → 光柱 ──
+  var tP = tScene;
+  if (tw > 0.02) { tP = twt / tw; }
+  let tEnd = min(tScene, 40000.0);
+  let pR = phaseR(cosT);
+  let pM = phaseM(cosT, A.mie.w);
+  var Af = vec3f(0.0); var Ab = vec3f(0.0); var Uf = vec3f(0.0); var Ub = vec3f(0.0);
+  var Tf = vec3f(1.0);
+  var Tff = vec3f(1.0);
+  let kexp = 3.4;
+  var tPrev = 0.0;
+  for (var i = 0; i < FOG_STEPS; i++) {
+    let u1 = (f32(i) + 1.0) / f32(FOG_STEPS);
+    let tNext = tEnd * (exp(kexp * u1) - 1.0) / (exp(kexp) - 1.0);
+    let dt = tNext - tPrev;
+    let t = tPrev + dt * fract(jit + 0.618034 * f32(i));
+    let p = ro + rd * t;
+    let hkm = max(p.y, 0.0) * 0.001;
+    let m = medium(hkm);
+    let ext = m.ext * 0.001;
+    let scR = m.scatR * 0.001;
+    let scM = m.scatM * 0.001;
+    let Ts = transToSun(RG + hkm, sunL.y);
+    let msv = textureSampleLevel(msLUT, sLin, vec2f(sunL.y * 0.5 + 0.5, saturate(hkm / (RTOP - RG))), 0.0).rgb;
+    var sh = 1.0;
+    if (t < 12000.0) {
+      sh = plumeShadow(p);
+#if FOG_CSM
+      // 建築的影子只在近處進霧（遠處細長的影子在少量取樣下只會變成雜線）
+      if (t < 700.0) { sh *= mix(csm1(p), 1.0, smoothstep(350.0, 700.0, t)); }
+#endif
+    }
+    let S1 = A.sunE.rgb * Ts * (scR * pR + vec3f(scM * pM));
+    let Sm = A.sunE.rgb * msv * (scR + vec3f(scM));
+    let sT = exp(-ext * dt);
+    let wI = (vec3f(1.0) - sT) / max(ext, vec3f(1e-9));
+    let cs = Tf * wI * (S1 * sh + Sm);
+    let cu = Tf * wI * (S1 + Sm);
+    Tf *= sT;
+    if (t < tP) { Af += cs; Uf += cu; Tff = Tf; } else { Ab += cs; Ub += cu; }
+    tPrev = tNext;
+  }
+  var o: MarchOut;
+  if (isSky) {
+    // 天空像素：天空 LUT 已含整條視線的散射，這裡只扣掉被擋住的部分，並把煙流前方的空氣光補回來
+    o.col = vec4f((1.0 - Tp) * Uf + Tff * Lp - (Uf - Af) - Tp * (Ub - Ab), Tp);
+  } else {
+    o.col = vec4f(Af + Tff * Lp + Tp * Ab, Tp * dot(Tf, vec3f(1.0 / 3.0)));
+  }
+  o.aux = vec4f(tP, zlin, 0.0, 0.0);
+  return o;
+}
+</script>
+
+<script type="text/wgsl" id="vol_temporal">
+// ── vol_temporal：體積結果的時間累積。用上一幀的矩陣重投影，並夾在目前鄰域的範圍內（抑制鬼影）──
+#include common
+#include fullscreen
+@group(1) @binding(0) var curTex: texture_2d<f32>;
+@group(1) @binding(1) var auxTex: texture_2d<f32>;
+@group(1) @binding(2) var histTex: texture_2d<f32>;
+struct VolU { p: vec4f };   // x＝1：沒有可用的歷史（剛啟動、改解析度或瞬間移動）
+@group(1) @binding(3) var<uniform> VU: VolU;
+@fragment fn fs(in: FSOut) -> @location(0) vec4f {
+  let pc = vec2i(in.pos.xy);
+  let dim = vec2i(textureDimensions(curTex));
+  let cur = textureLoad(curTex, pc, 0);
+  var mn = cur;
+  var mx = cur;
+  for (var j = -1; j <= 1; j++) { for (var i = -1; i <= 1; i++) {
+    let c = textureLoad(curTex, clamp(pc + vec2i(i, j), vec2i(0), dim - vec2i(1)), 0);
+    mn = min(mn, c); mx = max(mx, c);
+  } }
+  let aux = textureLoad(auxTex, pc, 0);
+  let wp = F.camPos.xyz + normalize(viewRay(in.uv)) * aux.r;
+  let pp = F.prevViewProj * vec4f(wp, 1.0);
+  let puv = pp.xy / max(pp.w, 1e-6) * vec2f(0.5, -0.5) + 0.5;
+  var k = 0.93;
+  if (VU.p.x > 0.5 || pp.w <= 0.0 || puv.x < 0.0 || puv.y < 0.0 || puv.x > 1.0 || puv.y > 1.0) { k = 0.0; }
+  let hist = textureSampleLevel(histTex, sLin, puv, 0.0);
+  let ex = (mx - mn) * 0.75 + vec4f(1e-4);
+  return mix(cur, clamp(hist, mn - ex, mx + ex), k);
+}
+</script>
+
+<script type="text/wgsl" id="vol_composite">
+// ── vol_composite：把低解析度的體積結果合成回全解析度（深度感知升採樣）。混合：out = L + T·scene ──
+#include common
+#include fullscreen
+@group(1) @binding(0) var volTex: texture_2d<f32>;
+@group(1) @binding(1) var auxTex: texture_2d<f32>;
+#if MSAA
+@group(1) @binding(2) var depthIn: texture_depth_multisampled_2d;
+#else
+@group(1) @binding(2) var depthIn: texture_depth_2d;
+#endif
+@fragment fn fs(in: FSOut) -> @location(0) vec4f {
+  let zf = min(linDepth(textureLoad(depthIn, vec2i(in.pos.xy), 0)), 60000.0);
+  let dim = vec2f(textureDimensions(volTex));
+  let st = in.uv * dim - 0.5;
+  let i0 = vec2i(floor(st));
+  let f = st - floor(st);
+  var acc = vec4f(0.0);
+  var ws = 0.0;
+  for (var k = 0; k < 4; k++) {
+    let o = vec2i(k & 1, k >> 1u);
+    let c = clamp(i0 + o, vec2i(0), vec2i(dim) - vec2i(1));
+    let z = textureLoad(auxTex, c, 0).g;
+    let bw = mix(1.0 - f.x, f.x, f32(o.x)) * mix(1.0 - f.y, f.y, f32(o.y));
+    let w = bw / (0.03 + abs(z - zf) / max(zf, 1.0)) + 1e-5;
+    acc += textureLoad(volTex, c, 0) * w;
+    ws += w;
+  }
+  return acc / ws;
+}
+</script>
+
 <script type="text/wgsl" id="resolve">
 // ── resolve：MSAA 自訂 resolve。用可逆 tone map 的權重平均，避免超亮像素讓邊緣鋸齒 ──
 #include common
@@ -1032,13 +1458,54 @@ fn palette(h: f32) -> vec3f {                    // 貨櫃常見顏色
 }
 </script>
 
+<script type="text/wgsl" id="bloom_down">
+// ── bloom_down：逐級降採樣（13 點濾波）。第一級用 Karis 平均壓住單點超亮像素，避免閃爍 ──
+#include common
+#include fullscreen
+@group(1) @binding(0) var srcTex: texture_2d<f32>;
+fn tap(uv: vec2f) -> vec3f { return max(textureSampleLevel(srcTex, sLin, uv, 0.0).rgb, vec3f(0.0)); }
+fn kw(c: vec3f) -> f32 { return 1.0 / (1.0 + luma(c)); }
+@fragment fn fs(in: FSOut) -> @location(0) vec4f {
+  let ts = 1.0 / vec2f(textureDimensions(srcTex));
+  let uv = in.uv;
+  let a = tap(uv + ts * vec2f(-2.0, -2.0)); let b = tap(uv + ts * vec2f(0.0, -2.0)); let c = tap(uv + ts * vec2f(2.0, -2.0));
+  let d = tap(uv + ts * vec2f(-2.0, 0.0));  let e = tap(uv);                          let f = tap(uv + ts * vec2f(2.0, 0.0));
+  let g = tap(uv + ts * vec2f(-2.0, 2.0));  let h = tap(uv + ts * vec2f(0.0, 2.0));  let i = tap(uv + ts * vec2f(2.0, 2.0));
+  let j = tap(uv + ts * vec2f(-1.0, -1.0)); let k = tap(uv + ts * vec2f(1.0, -1.0));
+  let l = tap(uv + ts * vec2f(-1.0, 1.0));  let m = tap(uv + ts * vec2f(1.0, 1.0));
+#if KARIS
+  let g0 = (a + b + d + e) * 0.25; let g1 = (b + c + e + f) * 0.25; let g2 = (d + e + g + h) * 0.25; let g3 = (e + f + h + i) * 0.25; let g4 = (j + k + l + m) * 0.25;
+  let w0 = kw(g0) * 0.125; let w1 = kw(g1) * 0.125; let w2 = kw(g2) * 0.125; let w3 = kw(g3) * 0.125; let w4 = kw(g4) * 0.5;
+  return vec4f((g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / (w0 + w1 + w2 + w3 + w4), 1.0);
+#else
+  return vec4f(e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h) * 0.0625 + (j + k + l + m) * 0.125, 1.0);
+#endif
+}
+</script>
+
+<script type="text/wgsl" id="bloom_up">
+// ── bloom_up：逐級升採樣（3×3 tent），用加色混合疊回上一級 ──
+#include common
+#include fullscreen
+@group(1) @binding(0) var srcTex: texture_2d<f32>;
+@fragment fn fs(in: FSOut) -> @location(0) vec4f {
+  let ts = 1.0 / vec2f(textureDimensions(srcTex));
+  var s = textureSampleLevel(srcTex, sLin, in.uv, 0.0).rgb * 4.0;
+  s += (textureSampleLevel(srcTex, sLin, in.uv + ts * vec2f(-1.0, 0.0), 0.0).rgb + textureSampleLevel(srcTex, sLin, in.uv + ts * vec2f(1.0, 0.0), 0.0).rgb
+      + textureSampleLevel(srcTex, sLin, in.uv + ts * vec2f(0.0, -1.0), 0.0).rgb + textureSampleLevel(srcTex, sLin, in.uv + ts * vec2f(0.0, 1.0), 0.0).rgb) * 2.0;
+  s += textureSampleLevel(srcTex, sLin, in.uv + ts * vec2f(-1.0, -1.0), 0.0).rgb + textureSampleLevel(srcTex, sLin, in.uv + ts * vec2f(1.0, -1.0), 0.0).rgb
+     + textureSampleLevel(srcTex, sLin, in.uv + ts * vec2f(-1.0, 1.0), 0.0).rgb + textureSampleLevel(srcTex, sLin, in.uv + ts * vec2f(1.0, 1.0), 0.0).rgb;
+  return vec4f(s / 16.0, 1.0);
+}
+</script>
+
 <script type="text/wgsl" id="post_final">
 // ── post_final：曝光 → AgX → 調色 → dithering → canvas ──
 #include common
 #include fullscreen
 struct PostU {
   p0: vec4f,   // x 曝光倍率，y bloom 強度，z 去飽和（分析模式），w 暗角強度
-  p1: vec4f,   // x canvas 寬，y canvas 高，z 幀序號，w 預留
+  p1: vec4f,   // x canvas 寬，y canvas 高，z 幀序號，w＝1/bloom 層數
 };
 @group(1) @binding(0) var<uniform> P: PostU;
 @group(1) @binding(1) var hdrTex: texture_2d<f32>;
@@ -1078,7 +1545,7 @@ fn toSrgb(c: vec3f) -> vec3f {
 }
 @fragment fn fs(in: FSOut) -> @location(0) vec4f {
   var c = max(textureSampleLevel(hdrTex, sLin, in.uv, 0.0).rgb, vec3f(0.0));
-  let b = max(textureSampleLevel(bloomTex, sLin, in.uv, 0.0).rgb, vec3f(0.0));
+  let b = max(textureSampleLevel(bloomTex, sLin, in.uv, 0.0).rgb, vec3f(0.0)) * P.p1.w;   // p1.w＝1/層數（各級是加總起來的）
   c = mix(c, b, P.p0.y) * P.p0.x;
   // 暗角
   let q = in.uv - 0.5;
@@ -1108,8 +1575,8 @@ const CFG = {
   q: QS.get('q'),
 };
 const TIERS = {
-  ultra:  {name:'ultra',  msaa:4, maxScale:1.0,  minScale:0.7,  shadowN:4, shadowRes:2048, pcf:16, volDiv:2, volSteps:96, fogSteps:24, lvol:[192,96,64], lvolEvery:1, reflDiv:2, reflLevel:3, terrN:128, bloomMips:7, lightFrac:1.0, birds:2000},
-  high:   {name:'high',   msaa:4, maxScale:1.0,  minScale:0.6,  shadowN:3, shadowRes:2048, pcf:9,  volDiv:2, volSteps:64, fogSteps:16, lvol:[160,80,48],  lvolEvery:2, reflDiv:2, reflLevel:3, terrN:96,  bloomMips:6, lightFrac:1.0, birds:2000},
+  ultra:  {name:'ultra',  msaa:4, maxScale:1.0,  minScale:0.7,  shadowN:4, shadowRes:2048, pcf:16, volDiv:2, volSteps:96, fogSteps:24, lvol:[224,112,96], lvolEvery:1, reflDiv:2, reflLevel:3, terrN:128, bloomMips:7, lightFrac:1.0, birds:2000},
+  high:   {name:'high',   msaa:4, maxScale:1.0,  minScale:0.6,  shadowN:3, shadowRes:2048, pcf:9,  volDiv:2, volSteps:64, fogSteps:16, lvol:[176,88,72],  lvolEvery:2, reflDiv:2, reflLevel:3, terrN:96,  bloomMips:6, lightFrac:1.0, birds:2000},
   medium: {name:'medium', msaa:1, maxScale:0.85, minScale:0.5,  shadowN:3, shadowRes:1024, pcf:4,  volDiv:3, volSteps:40, fogSteps:12, lvol:[128,64,32],  lvolEvery:3, reflDiv:4, reflLevel:2, terrN:64,  bloomMips:5, lightFrac:0.7, birds:600},
   low:    {name:'low',    msaa:1, maxScale:0.7,  minScale:0.45, shadowN:2, shadowRes:1024, pcf:4,  volDiv:4, volSteps:28, fogSteps:8,  lvol:[96,48,24],   lvolEvery:4, reflDiv:4, reflLevel:1, terrN:48,  bloomMips:5, lightFrac:0.5, birds:300},
 };
@@ -1124,12 +1591,12 @@ const DEFAULTS = {
   hs: 250,         // 最高那支煙囪的高度 [m]
   Q: 150,          // 每支煙囪的排放量 [g/s]
   Ts: 55,          // 排氣溫度 [°C]
-  vs: 18,          // 排氣速度 [m/s]
-  d: 7,            // 煙囪出口內徑 [m]（固定）
-  Ta: 27,          // 氣溫 [°C]
+  vs: 20,          // 排氣速度 [m/s]
+  d: 8,            // 煙囪出口內徑 [m]（固定）
+  Ta: 26,          // 氣溫 [°C]
   lid: false,      // 逆溫層
   zi: 800,         // 混合層高度 [m]
-  rh: 85,          // 相對濕度 [%]
+  rh: 95,          // 相對濕度 [%]（梅雨季的潮濕傍晚；白煙長度對濕度很敏感，降到 60% 會剩不到三分之一）
   thresh: 50,      // 門檻線 [μg/m³]（示意值）
 };
 
@@ -1500,9 +1967,9 @@ function parseStruct(code, name) {
   const m = new RegExp('struct\\s+' + name + '\\s*\\{([^}]*)\\}').exec(code);
   if (!m) throw new Error('找不到 struct ' + name);
   const fields = {}; let off = 0;
-  for (const line of m[1].split('\n')) {
-    const fm = /^\s*(\w+)\s*:\s*(array<\s*\w+\s*,\s*\d+\s*>|\w+)/.exec(line);
-    if (!fm) continue;
+  const body = m[1].replace(/\/\/[^\n]*/g, ''), re = /(\w+)\s*:\s*(array<\s*\w+\s*,\s*\d+\s*>|\w+)/g;
+  let fm;
+  while ((fm = re.exec(body))) {
     let type = fm[2], count = 1;
     const am = /^array<\s*(\w+)\s*,\s*(\d+)\s*>$/.exec(type);
     if (am) { type = am[1]; count = +am[2]; }
@@ -1627,12 +2094,25 @@ function allocTargets() {
   const scale = clamp(S.renderScale, TIER.minScale, 1) * TIER.maxScale;
   const w = Math.max(8, Math.round(canvas.width * scale)), h = Math.max(8, Math.round(canvas.height * scale));
   if (RT.w === w && RT.h === h && RT.msaa === TIER.msaa) return false;
-  for (const k of ['hdr', 'msColor', 'depth']) if (RT[k]) { RT[k].destroy(); RT[k] = null; }
+  for (const k of ['hdr', 'msColor', 'depth', 'volCur', 'volAux']) if (RT[k]) { RT[k].destroy(); RT[k] = null; }
+  if (RT.volHist) RT.volHist.forEach(t => t.destroy());
   RT.w = w; RT.h = h; RT.msaa = TIER.msaa;
-  const U = GPUTextureUsage;
-  RT.hdr = mkTex('hdr', w, h, 'rgba16float', U.RENDER_ATTACHMENT | U.TEXTURE_BINDING);
-  if (TIER.msaa > 1) RT.msColor = mkTex('msColor', w, h, 'rgba16float', U.RENDER_ATTACHMENT | U.TEXTURE_BINDING, {samples: TIER.msaa});
-  RT.depth = mkTex('depth', w, h, 'depth32float', U.RENDER_ATTACHMENT | U.TEXTURE_BINDING, {samples: TIER.msaa});
+  const U = GPUTextureUsage, RU = U.RENDER_ATTACHMENT | U.TEXTURE_BINDING;
+  RT.hdr = mkTex('hdr', w, h, 'rgba16float', RU);
+  if (TIER.msaa > 1) RT.msColor = mkTex('msColor', w, h, 'rgba16float', RU, {samples: TIER.msaa});
+  RT.depth = mkTex('depth', w, h, 'depth32float', RU, {samples: TIER.msaa});
+  // 體積（低解析度）：本幀結果、輔助資訊、時間累積的兩張歷史（輪流當輸入與輸出）
+  const vw = Math.max(4, Math.ceil(w / TIER.volDiv)), vh = Math.max(4, Math.ceil(h / TIER.volDiv));
+  RT.volCur = mkTex('volCur', vw, vh, 'rgba16float', RU);
+  RT.volAux = mkTex('volAux', vw, vh, 'rg16float', RU);
+  RT.volHist = [mkTex('volHist0', vw, vh, 'rgba16float', RU), mkTex('volHist1', vw, vh, 'rgba16float', RU)];
+  RT.histIdx = 0; S.volReset = true;
+  RES.depthIn = RT.depth.view; RES.curTex = RT.volCur.view; RES.auxTex = RT.volAux.view;
+  // bloom：每級解析度減半
+  if (RT.bloom) RT.bloom.forEach(t => t.destroy());
+  RT.bloom = [];
+  for (let i = 0, bw = w, bh = h; i < TIER.bloomMips; i++) { bw = Math.max(2, bw >> 1); bh = Math.max(2, bh >> 1); RT.bloom.push(mkTex('bloom' + i, bw, bh, 'rgba16float', RU)); }
+  RES.bloomTex = RT.bloom[0].view;
   RES.hdrTex = RT.hdr.view;
   RES.msTex = RT.msColor ? RT.msColor.view : null;
   GPU.gen++;
@@ -1643,7 +2123,7 @@ const ATMO = {
   rayleigh: [5.802e-3, 13.558e-3, 33.1e-3], hR: 8,
   mieS: 3.996e-3, mieA: 4.40e-3, hM: 1.2, g: 0.8,
   ozone: [0.650e-3, 1.881e-3, 0.085e-3],
-  hazeS: 0.030, hazeA: 0.003, hH: 0.7,
+  hazeS: 0.012, hazeA: 0.0015, hH: 0.7,
   E0: 20, sunRad: 0.00465, albedo: 0.12, cloud: 0.55, sunClamp: 9000, dirty: true,
 };
 const RGk = 6360, RTk = 6460;
@@ -1666,7 +2146,7 @@ function transCPU(hKm, mu) {
   return od.map(o => Math.exp(-o) * vis);
 }
 // 曝光：依太陽高度（度）內插 EV；數值是看截圖調出來的
-const EXPO_TABLE = [[25, -1.3], [10, -0.8], [3.6, 0.0], [0, 0.8], [-3, 2.3], [-6, 4.4], [-9, 6.0], [-12, 6.8], [-18, 7.2]];
+const EXPO_TABLE = [[25, -1.6], [10, -1.2], [3.6, -0.75], [0, 0.2], [-3, 2.0], [-6, 4.2], [-9, 6.0], [-12, 6.8], [-18, 7.2]];
 function exposureFor(elDeg) {
   const T = EXPO_TABLE;
   if (elDeg >= T[0][0]) return 2 ** T[0][1];
@@ -1751,6 +2231,8 @@ function buildStatic() {
   RES.F = UFrame.buf;
   UPost = new UBO('PostU', 'PostU', WGSL_SRC.post_final);
   RES.P = UPost.buf;
+  UPlume = new UBO('PlumeU', 'PlumeU', WGSL_SRC.common);   // group 0 的成員，所有 pipeline 都會綁到，所以要最早建立
+  RES.PL = UPlume.buf;
   const black = mkTex('black', 1, 1, 'rgba16float', GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST);
   device.queue.writeTexture({texture: black}, new Uint16Array(4), {}, [1, 1]);
   RES.black = black.view;
@@ -1798,6 +2280,15 @@ function buildPipelines() {
   P.terrain = mkRender({label: 'terrain', id: 'terrain', targets: HDR, samples: TIER.msaa, depth: depthMain, buffers: GRID});
   P.water = mkRender({label: 'water', id: 'water', targets: HDR, samples: TIER.msaa, depth: depthMain, primitive: {topology: 'triangle-strip', cullMode: 'none'}});
   P.mesh = mkRender({label: 'mesh', id: 'mesh', targets: HDR, samples: TIER.msaa, depth: depthMain, buffers: MESH_BUFFERS});
+  const MS = {MSAA: TIER.msaa > 1, FOG_CSM: TIER.name === 'ultra' || TIER.name === 'high'};
+  P.lightvol = mkCompute({label: 'lightvol', id: 'lightvol'});
+  P.volMarch = mkRender({label: 'volMarch', id: 'vol_march', defs: MS, targets: [{format: 'rgba16float'}, {format: 'rg16float'}]});
+  P.volTemporal = mkRender({label: 'volTemporal', id: 'vol_temporal', targets: HDR});
+  P.volComposite = mkRender({label: 'volComposite', id: 'vol_composite', defs: MS, targets: [{format: 'rgba16float',
+    blend: {color: {srcFactor: 'one', dstFactor: 'src-alpha', operation: 'add'}, alpha: {srcFactor: 'zero', dstFactor: 'one', operation: 'add'}}}]});
+  P.bloomDownK = mkRender({label: 'bloomDownK', id: 'bloom_down', defs: {KARIS: true}, targets: HDR});
+  P.bloomDown = mkRender({label: 'bloomDown', id: 'bloom_down', targets: HDR});
+  P.bloomUp = mkRender({label: 'bloomUp', id: 'bloom_up', targets: [{format: 'rgba16float', blend: {color: {srcFactor: 'one', dstFactor: 'one', operation: 'add'}, alpha: {srcFactor: 'zero', dstFactor: 'one', operation: 'add'}}}]});
   P.shadow = mkRender({label: 'shadow', id: 'shadow', buffers: MESH_BUFFERS,
     depth: {format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2.5}});
   P.lutTrans = mkRender({label: 'lutTrans', id: 'lut_trans', targets: HDR});
@@ -2031,8 +2522,8 @@ function buildMeshes() {
     const H = 250, rad = (t) => 5.2 + 6.3 * Math.pow(1 - t, 1.7), prof = [];
     for (let j = 0; j <= 16; j++) { const t = j / 16; prof.push([rad(t), t * H, t]); }
     MB.lathe(I, prof, 28, 2);
-    MB.lathe(I, [[5.2, H - 3, 0.99], [5.6, H - 2.6, 0.99], [5.6, H, 1], [4.6, H, 1]], 28, 2);     // 頂緣
-    MB.lathe(I, [[4.6, H, 0], [4.6, H - 10, 0], [0.01, H - 10, 0]], 28, 12);                        // 內壁（黑）
+    MB.lathe(I, [[5.2, H - 3, 0.99], [5.6, H - 2.6, 0.99], [5.6, H, 1], [4.0, H, 1]], 28, 2);     // 頂緣（出口內徑 8 m）
+    MB.lathe(I, [[4.0, H, 0], [4.0, H - 10, 0], [0.01, H - 10, 0]], 28, 12);                        // 內壁（黑）
     for (const t of [0.36, 0.63, 0.9]) { const r = rad(t); MB.lathe(m4.T(0, t * H, 0), [[r, -0.4], [r + 1.8, -0.4], [r + 1.8, 1.1], [r + 1.7, 1.1], [r + 1.7, 0], [r, 0]], 28, 5); }
   } MB.end();
   // 球形儲槽
@@ -2329,12 +2820,131 @@ const MESH_BUFFERS = [
   {arrayStride: 64, stepMode: 'instance', attributes: [{shaderLocation: 4, offset: 0, format: 'float32x4'}, {shaderLocation: 5, offset: 16, format: 'float32x4'}, {shaderLocation: 6, offset: 32, format: 'float32x4'}, {shaderLocation: 7, offset: 48, format: 'float32x4'}]},
 ];
 
+// ═══ §J5c 煙流：物理模型 → 3D 外觀用的查表與體積 ═════════════════════
+const PLUME = {M: null, cond: null, xEvap: 0, pts: [], dirty: true, lvCount: 0};
+// 依穩定度的瞬時煙流參數：[水平瞬時比例, 垂直瞬時比例, 水平蜿蜒波長 m, 垂直蜿蜒波長 m]
+// 瞬時比例＝瞬時煙流寬度佔時間平均 σ 的比例；其餘的擴散由蜿蜒（大渦流把整條煙流甩來甩去）提供。
+// A 級上下翻騰劇烈、D 級接近錐狀、F 級垂直方向幾乎不動（扁平帶狀，只有水平慢擺）。
+const STAB = {A: [0.50, 0.45, 420, 300], B: [0.56, 0.52, 520, 420], C: [0.64, 0.62, 680, 620], D: [0.72, 0.78, 900, 1000], E: [0.80, 0.90, 1500, 2400], F: [0.82, 0.96, 2300, 5000]};
+const LUT_XMAX = 12000;
+let UPlume = null, ULV = null, UVol = null;
+function buildPlumeResources() {
+  const U = GPUTextureUsage;
+  // 3D 雜訊（compute 產生一次）
+  const n3 = device.createTexture({label: 'noise3D', size: [64, 64, 64], dimension: '3d', format: 'rgba8unorm', usage: U.STORAGE_BINDING | U.TEXTURE_BINDING});
+  RES.noise3D = n3.createView();
+  const P = mkCompute({label: 'noise3dGen', id: 'noise3d_gen'});
+  const enc = device.createCommandEncoder(), cp = enc.beginComputePass();
+  cp.setPipeline(P.pipeline);
+  cp.setBindGroup(0, device.createBindGroup({layout: P.bgls[0], entries: [{binding: 0, resource: RES.noise3D}]}));
+  cp.dispatchWorkgroups(16, 16, 16); cp.end();
+  device.queue.submit([enc.finish()]);
+  PLUME.lutTex = device.createTexture({label: 'plumeLUT', size: [512, 4], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.COPY_DST});
+  PLUME.condTex = device.createTexture({label: 'condLUT', size: [256, 1], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.COPY_DST});
+  RES.plumeLUT = PLUME.lutTex.createView(); RES.condLUT = PLUME.condTex.createView();
+  const d = TIER.lvol;
+  PLUME.lv = device.createTexture({label: 'lightVol', size: d, dimension: '3d', format: 'rgba16float', usage: U.STORAGE_BINDING | U.TEXTURE_BINDING});
+  RES.lightVol = RES.lvOut = PLUME.lv.createView();
+  ULV = new UBO('LVU', 'LVU', WGSL_SRC.lightvol); RES.LV = ULV.buf;
+  UVol = new UBO('VolU', 'VolU', WGSL_SRC.vol_temporal); RES.VU = UVol.buf;
+  PLUME.dirty = true;
+}
+// 物理參數變動時：重建模型、凝結表、煙流查表、外框
+function updatePlumeModel() {
+  const p = S.params, PLN = WORLD.plain;
+  const M = PLUME.M = PHYS.build(p, WORLD.stacks.map((s, i) => ({x: s.x, z: s.z, h: stackHeight(i)})));
+  const cond = PLUME.cond = PHYS.condensation(p);
+  PLUME.max = PHYS.findMax(M);
+  // 凝結表：液態水混合比 → 消光係數。β = 3·LWC/(2·ρw·r_eff)，r_eff = 8 μm；再乘 0.35 並設上限，讓邊緣有柔和的過渡
+  const BK = 1.5 * 1.16 / (1000 * 8e-6) * 1.2, cl = new Uint16Array(256 * 4);
+  for (let i = 0; i < 256; i++) cl[i * 4] = f16(Math.min(cond.lut[i] * BK, 0.36));
+  device.queue.writeTexture({texture: PLUME.condTex}, cl, {bytesPerRow: 256 * 8}, [256, 1]);
+  const st = STAB[p.cls], r0 = p.d / 2, s0 = r0 / Math.SQRT2, data = new Uint16Array(512 * 4 * 4);
+  const Ta = p.Ta + 273.15, Ts = Math.max(p.Ts, p.Ta) + 273.15;
+  const hazeK = 0.035 * (1 + 3 * smooth(70, 98, p.rh)) * Math.sqrt(p.Q / 150);  // 氣膠霾：濕度高時吸濕長大、散射變強
+  const rows = M.src.map((s) => {
+    const fK = Ta / Ts * r0 * r0 * p.vs / (2 * s.us), row = [];
+    for (let j = 0; j < 512; j++) {
+      const x = (j / 511) ** 2 * LUT_XMAX, sg = PHYS.sigmaK(M.k, Math.max(x, 0.01)), bid = PHYS.dhAt(s, Math.max(x, 0.01)) / 3.5;
+      let dh = bid * 3.5, syi = Math.sqrt(s0 * s0 + bid * bid + (st[0] * sg.sy) ** 2), szi = Math.sqrt(s0 * s0 + bid * bid + (st[1] * sg.sz) ** 2);
+      const ay = Math.sqrt(1 - st[0] * st[0]) * sg.sy, az = Math.sqrt(1 - st[1] * st[1]) * sg.sz;
+      if (M.lid && !s.pen) { szi = Math.min(szi, M.zi / 3); dh = Math.min(dh, Math.max(M.zi - s.hsE - 1.6 * szi, 0)); }   // 逆溫層：煙流被壓在混合層頂以下
+      row.push({x, dh, syi, szi, ay, az, f: Math.min(fK / (syi * szi), 1)});
+    }
+    return {s, fK, row};
+  });
+  rows.forEach((r, i) => r.row.forEach((e, j) => { const o = (i * 512 + j) * 4; data[o] = f16(e.dh); data[o + 1] = f16(e.syi); data[o + 2] = f16(e.szi); data[o + 3] = f16(e.ay); }));
+  device.queue.writeTexture({texture: PLUME.lutTex}, data, {bytesPerRow: 512 * 8}, [512, 4]);
+  // 白煙（凝結水氣）可見長度：中心線混合比例（含湍流峰值約 1.6 倍）降到臨界值的距離
+  const main = rows[1].row;
+  let xe = 0; for (const e of main) if (e.f * 1.6 >= cond.fcrit) xe = e.x;
+  PLUME.xEvap = xe;
+  let xd = 600; for (const e of main) if (Math.min(e.f, 0.03) * hazeK > 3e-6) xd = e.x;
+  const xDraw = PLUME.xDraw = clamp(xd, 600, 9000);
+  const e5 = main.find(e => e.x >= 500) || main[511];
+  const us = M.src.reduce((a, s) => a + s.us, 0) / M.src.length;
+  // 外框（煙流座標）與「濃密段」的取樣點（給光學深度體積定範圍）
+  const mn = [-3 * r0 - 2, 1e9, 1e9], mx = [xDraw, -1e9, -1e9], pts = [], xDense = clamp(1.25 * xe + 30, 120, 2600);
+  rows.forEach((r, i) => {
+    const s = r.s, ox = (s.x - M.cx) * M.wd[0] + (s.z - M.cz) * M.wd[1], oc = (s.z - M.cz) * M.wd[0] - (s.x - M.cx) * M.wd[1], y0 = PLN + s.hsE;
+    mn[0] = Math.min(mn[0], ox - 3 * r0 - 2); mx[0] = Math.max(mx[0], ox + xDraw);
+    for (let j = 0; j < 512; j += 6) {
+      const e = r.row[j]; if (e.x > xDraw) break;
+      const hy = 4.2 * e.syi + 2.2 * e.ay, hz = 4.2 * e.szi + 2.2 * e.az;
+      mn[1] = Math.min(mn[1], y0 + e.dh - hz); mx[1] = Math.max(mx[1], y0 + e.dh + hz);
+      mn[2] = Math.min(mn[2], oc - hy); mx[2] = Math.max(mx[2], oc + hy);
+      // 光學深度體積只包住「有凝結水氣」的範圍（混合比例高於臨界值的地方），體素才夠細
+      if (e.x <= xDense) {
+        const dm = Math.min(Math.sqrt(2 * Math.log(Math.max(e.f * 3 / cond.fcrit, 1.5))), 4.2);
+        const ty = dm * e.syi * 1.2 + 2.3 * e.ay + 3, tz = dm * e.szi * 1.2 + 2.3 * e.az + 3;
+        for (const a of [-1, 1]) for (const b of [-1, 1]) {
+          const lx = ox + e.x, lc = oc + a * ty, ly = Math.max(y0 + e.dh + b * tz, 0);
+          pts.push([M.cx + lx * M.wd[0] - lc * M.wd[1], ly, M.cz + lx * M.wd[1] + lc * M.wd[0]]);
+        }
+      }
+    }
+    UPlume.set('src', [s.x, y0, s.z, r.fK], i);
+  });
+  mn[1] = Math.max(mn[1], 0);
+  PLUME.pts = pts; PLUME.rows = rows; PLUME.hazeK = hazeK;
+  UPlume.set('wind', [M.wd[0], M.wd[1], us, xDraw]).set('prm', [LUT_XMAX, e5.az / Math.max(e5.ay, 1e-3), st[2], hazeK])
+    .set('prm2', [M.lid ? M.zi : 0, 0, st[3], r0]).set('obbMin', [...mn, M.cx]).set('obbMax', [...mx, M.cz]);
+  PLUME.dirty = false; PLUME.lvCount = 0;
+}
+// 每幀：依太陽方向擺放光學深度體積（只包住濃密段，體素才夠細）
+function updatePlumeFrame() {
+  if (PLUME.dirty || S.paramsDirty) { S.paramsDirty = false; updateStacks(); updatePlumeModel(); }
+  const M = PLUME.M;
+  PLUME.bake = SUN.el > -1.5 * DEG && PLUME.pts.length > 0 && !S.dbgNoLV;
+  if (PLUME.bake) {
+    const L = dirFromAzEl(SUN.az, Math.max(SUN.el, 0.6 * DEG)), W = v3.scale(L, -1), wd3 = [M.wd[0], 0, M.wd[1]];
+    let Uv = v3.sub(wd3, v3.scale(W, v3.dot(wd3, W)));
+    if (v3.len(Uv) < 0.2) Uv = v3.cross(W, [0, 1, 0]);
+    Uv = v3.norm(Uv);
+    const Vv = v3.cross(W, Uv), lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+    for (const p of PLUME.pts) [Uv, Vv, W].forEach((a, k) => { const d = v3.dot(p, a); lo[k] = Math.min(lo[k], d); hi[k] = Math.max(hi[k], d); });
+    const len = [0, 1, 2].map(k => (hi[k] - lo[k]) * 1.06 + 4), o0 = [0, 1, 2].map(k => lo[k] - (len[k] - (hi[k] - lo[k])) / 2);
+    const org = v3.add(v3.add(v3.scale(Uv, o0[0]), v3.scale(Vv, o0[1])), v3.scale(W, o0[2]));
+    ULV.set('o', [...org, 0]).set('u', [...v3.scale(Uv, len[0]), 0]).set('v', [...v3.scale(Vv, len[1]), 0]).set('w', [...v3.scale(W, len[2]), 0]);
+    ULV.upload();
+    [Uv, Vv, W].forEach((a, k) => UPlume.set('lv' + k, [a[0] / len[k], a[1] / len[k], a[2] / len[k], -o0[k] / len[k]]));
+    PLUME.lvLen = len;
+    UPlume.set('prm2', [PLUME.M.lid ? PLUME.M.zi : 0, len[2] / TIER.lvol[2], STAB[S.params.cls][3], S.params.d / 2]);   // y＝沿光線方向一格體素的長度
+  } else {
+    UPlume.set('lv0', [0, 0, 0, -1]).set('lv1', [0, 0, 0, -1]).set('lv2', [0, 0, 0, -1]);   // 沒有太陽：不查體積
+  }
+  const fl = SCENE.flare || [0, 0, 0];
+  const flick = 0.85 + 0.15 * Math.sin(S.simTime * 9.0) * Math.sin(S.simTime * 3.7 + 1.0);
+  UPlume.set('flare', [fl[0], fl[1] + 6, fl[2], 14 * flick]).set('glow', [0.020 * SUN.night, 0.012 * SUN.night, 0.006 * SUN.night, 0]);
+  UPlume.upload();
+}
+
 // ═══ §J6 各個 pass ════════════════════════════════════════════════════
 const SUN = {dir: [0, 1, 0], az: 0, el: 0, illum: [1, 1, 1], night: 0};
 function updateSun() {
   // 太陽：日落時（timeMin=0）高度 0°；每分鐘下降約 0.225°，方位每分鐘往北約 0.1°（高雄 9 月中旬的近似）
   SUN.el = -S.timeMin * 0.225 * DEG;
-  SUN.az = (272 + (S.timeMin + 16) * 0.1) * DEG;
+  SUN.az = (267.6 + (S.timeMin + 16) * 0.1) * DEG;
   SUN.dir = dirFromAzEl(SUN.az, SUN.el);
   const elDeg = SUN.el / DEG;
   SUN.illum = transCPU(0.05, Math.sin(SUN.el)).map(t => t * ATMO.E0);   // 地面附近的太陽照度（含大氣消光）
@@ -2359,7 +2969,8 @@ function updateFrameUniforms() {
     .set('time', [S.simTime, S.frame, S.modeK, 0]);
   updateShadows();
   UFrame.upload();
-  UPost.set('p0', [S.exposure, 0.0, S.modeK * 0.7, 0.35]).set('p1', [canvas.width, canvas.height, S.frame % 1024, 0]);
+  updatePlumeFrame();
+  UPost.set('p0', [S.exposure, lerp(0.07, 0.13, SUN.night), S.modeK * 0.7, 0.35]).set('p1', [canvas.width, canvas.height, S.frame % 1024, 1 / TIER.bloomMips]);
   UPost.upload();
   uploadAtmo();
   updateTerrainUniforms();
@@ -2379,6 +2990,14 @@ function render() {
   if (ATMO.dirty) { fsPass(enc, 'lutTrans', P.lutTrans, LUT.trans.view); fsPass(enc, 'lutMs', P.lutMs, LUT.ms.view); ATMO.dirty = false; }
   fsPass(enc, 'lutSky', P.lutSky, LUT.sky.view);
   fsPass(enc, 'amb', P.amb, LUT.amb.view);
+  // 煙流的光學深度體積（compute；依畫質等級隔幾幀更新一次）
+  if (PLUME.bake && (CFG.shot || PLUME.lvCount % TIER.lvolEvery === 0)) {
+    const cp = CP(enc, 'lightvol');
+    usePipeline(cp, P.lightvol);
+    cp.dispatchWorkgroups(Math.ceil(TIER.lvol[0] / 8), Math.ceil(TIER.lvol[1] / 8), 1);
+    cp.end();
+  }
+  PLUME.lvCount++;
   // 陰影
   for (let i = 0; i < TIER.shadowN; i++) {
     const pass = RP(enc, 'shadow' + i, {colorAttachments: [], depthStencilAttachment: {view: SHADOW.layers[i], depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store'}});
@@ -2403,6 +3022,32 @@ function render() {
   if (RT.msColor) {
     const pass = RP(enc, 'resolve', {colorAttachments: [{view: RT.hdr.view, loadOp: 'clear', storeOp: 'store'}]});
     usePipeline(pass, P.resolve); pass.draw(3); pass.end();
+  }
+  // 體積：raymarch → 時間累積 → 合成回 HDR
+  {
+    const pass = RP(enc, 'volMarch', {colorAttachments: [{view: RT.volCur.view, loadOp: 'clear', storeOp: 'store'}, {view: RT.volAux.view, loadOp: 'clear', storeOp: 'store'}]});
+    usePipeline(pass, P.volMarch); pass.draw(3); pass.end();
+    const hi = RT.histIdx, ho = 1 - hi;
+    UVol.set('p', [S.volReset ? 1 : 0, 0, 0, 0]); UVol.upload(); S.volReset = false;
+    const p2 = RP(enc, 'volTemporal', {colorAttachments: [{view: RT.volHist[ho].view, loadOp: 'clear', storeOp: 'store'}]});
+    usePipeline(p2, P.volTemporal, {histTex: RT.volHist[hi].view}, 'h' + hi); p2.draw(3); p2.end();
+    const p3 = RP(enc, 'volComposite', {colorAttachments: [{view: RT.hdr.view, loadOp: 'load', storeOp: 'store'}]});
+    usePipeline(p3, P.volComposite, {volTex: RT.volHist[ho].view}, 'h' + ho); p3.draw(3); p3.end();
+    RT.histIdx = ho;
+  }
+  // bloom：逐級降採樣，再逐級升採樣疊回去
+  {
+    const B = RT.bloom, n = B.length;
+    for (let i = 0; i < n; i++) {
+      const pass = RP(enc, 'bloomDown' + i, {colorAttachments: [{view: B[i].view, loadOp: 'clear', storeOp: 'store'}]});
+      usePipeline(pass, i === 0 ? P.bloomDownK : P.bloomDown, {srcTex: i === 0 ? RT.hdr.view : B[i - 1].view}, 'd' + i);
+      pass.draw(3); pass.end();
+    }
+    for (let i = n - 1; i >= 1; i--) {
+      const pass = RP(enc, 'bloomUp' + i, {colorAttachments: [{view: B[i - 1].view, loadOp: 'load', storeOp: 'store'}]});
+      usePipeline(pass, P.bloomUp, {srcTex: B[i].view}, 'u' + i);
+      pass.draw(3); pass.end();
+    }
   }
   {
     const pass = RP(enc, 'final', {colorAttachments: [{view: context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store'}]});
@@ -2483,6 +3128,21 @@ function updateCamera(dt) {
 }
 
 // ═══ §J9 測試鉤子 ═════════════════════════════════════════════════════
+// ?shot=N 的固定鏡頭。pos 的 y 若是 null，表示用「地形高度＋22 m」
+const SHOTS = {
+  1: {pos: [2750, null, -150], yaw: 270, pitch: -1.0, fov: 24, time: -16.7, mode: 0},                 // 開場黃昏全景
+  2: {pos: [235, 292, 345], target: [70, 292, 70], fov: 34, time: -16.7, mode: 0},                    // 近看煙囪出口與煙流
+  3: {pos: [182, 300, -34], target: [-815, 366, 10], fov: 55, time: -16.7, mode: 0},                  // 在煙流裡往太陽看
+  4: {pos: [1330, 46, -330], target: [0, 120, 130], fov: 38, time: 34, mode: 0},                      // 夜晚燈海與倒影
+  5: {pos: [1150, 5600, -1050], target: [1150, 0, -1049], fov: 50, time: -16.7, mode: 1},             // 分析模式俯視
+  6: {pos: [2750, null, -150], yaw: 268.2, pitch: 0.4, fov: 31, time: -16.7, mode: 0},                // 手機直式開場
+};
+function applyShot(n) {
+  const s = SHOTS[n]; if (!s) return;
+  const pos = [...s.pos]; if (pos[1] === null) pos[1] = heightAt(pos[0], pos[2]) + 22;
+  S.timeMin = s.time; S.mode = s.mode; S.modeK = s.mode;
+  window.__scene.setCamera(s.target ? {pos, target: s.target, fovDeg: s.fov} : {pos, yawDeg: s.yaw, pitchDeg: s.pitch, fovDeg: s.fov});
+}
 function selftestCPU() {
   const out = [];
   const chk = (id, name, val, ref, tol) => {
@@ -2520,7 +3180,7 @@ window.__scene = {
     if (o.yawDeg !== undefined) c.yaw = o.yawDeg * DEG;
     if (o.pitchDeg !== undefined) c.pitch = o.pitchDeg * DEG;
     if (o.fovDeg !== undefined) { c.fov = c.fovTarget = o.fovDeg * DEG; }
-    S.userActed = true; c.vel = [0, 0, 0];
+    S.userActed = true; c.vel = [0, 0, 0]; S.volReset = true;
   },
   setTime(min) { S.timeMin = clamp(+min, -90, 75); },
   setParams(o) { Object.assign(S.params, o); S.paramsDirty = true; },
@@ -2572,11 +3232,12 @@ async function start(isRestart) {
     for (const k of Object.keys(RES)) delete RES[k];
     GPU.bglCache.clear(); GPU.gen++;
     TIER = pickTier();
-    GPU.consts = {SHADOW_TAPS: TIER.pcf};
+    GPU.consts = {SHADOW_TAPS: TIER.pcf, VOL_STEPS: TIER.volSteps, FOG_STEPS: TIER.fogSteps, VOL_DIV: TIER.volDiv.toFixed(1)};
     timerInit();
     buildStatic();
     await buildTerrain();
     buildSceneGPU();
+    buildPlumeResources();
     buildPipelines();
     allocTargets();
     if (!isRestart && !S.camPlaced) { S.cam.pos[1] = heightAt(S.cam.pos[0], S.cam.pos[2]) + 22; S.camPlaced = true; }
@@ -2584,7 +3245,8 @@ async function start(isRestart) {
     console.log(`[海港夕煙] adapter=${GPU.adapterName} | ${GPU.glName} | 軟體渲染=${GPU.software} | 畫質=${TIER.name} | features=${GPU.features.join(',')}`);
     if (!isRestart) {
       initInput();
-      if (CFG.shot) { S.frozen = true; S.simTime = 40; S.userActed = true; }
+      if (CFG.shot) { S.frozen = true; S.simTime = 40; applyShot(CFG.shot); }
+      else { S.timeMin = SHOTS[1].time; S.cam.yaw = SHOTS[1].yaw * DEG; S.cam.pitch = SHOTS[1].pitch * DEG; }
       if (CFG.selftest) runSelftest();
       requestAnimationFrame(rafLoop);
     }

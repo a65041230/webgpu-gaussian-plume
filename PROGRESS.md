@@ -4,30 +4,56 @@
 
 ## 環境（2026-11-15 確認）
 - 本機伺服器：`python -m http.server 8765 --bind 127.0.0.1 --directory <專案資料夾>`（背景執行）。網址 `http://127.0.0.1:8765/index.html`。
-- 測試瀏覽器：Playwright MCP 的 Chrome 157。`navigator.gpu` 存在；adapter vendor＝nvidia、architecture＝turing（GTX 1650），`isFallbackAdapter=false`，不是 SwiftShader。
+- 測試瀏覽器：Playwright MCP 的 Chrome 157。`navigator.gpu` 存在；adapter vendor＝nvidia、architecture＝turing，WebGL 字串是「NVIDIA GeForce GTX 1650 … Direct3D11」，`isFallbackAdapter=false`，不是 SwiftShader。
 - 可用功能：`timestamp-query`、`float32-filterable`、`shader-f16` 都有；canvas 偏好格式 `bgra8unorm`。
 - 本機只有一張顯示卡（NVIDIA GeForce GTX 1650，沒有列出內顯）。
-- 注意：Playwright MCP 會把自己的紀錄檔寫到 `<Playwright MCP 的啟動目錄>\.playwright-mcp\`（它啟動時的工作目錄），這不是我能改的位置；最終報告要提。
+
+## 測試流程的注意事項
+- **Playwright 的視窗是最小化的**：`requestAnimationFrame` 每秒只有 1–2 次。程式裡有計時器備援（`LOOP.starved`），所以畫面照樣會跑，但 rAF 量到的幀率沒有意義，效能要看 `?bench=1` 的「等 GPU 做完」量法和 timestamp-query。
+- **瀏覽器會快取 index.html**：每次載入都要加 `&_=時間戳`，否則會拿到舊檔。
+- **Playwright MCP 只允許把截圖存在 `<Playwright MCP 的啟動目錄>\.playwright-mcp\`**（它啟動時的工作目錄）。截圖先存到那裡的 `hp\` 子資料夾，再搬到 `shots\`。這個 `.playwright-mcp` 資料夾是這次工作才產生的，最後要清掉並在報告說明。
+- 截圖用 `browser_run_code_unsafe`：`page.goto` → `waitForFunction(__shotReady)` → `page.screenshot`。多張圖用 scratchpad 的 `montage.ps1` 拼成一張再看，省 context。
 
 ## 里程碑
 - [x] M0 設計文件
-- [ ] M1 骨架：WebGPU 初始化、WGSL 模組載入、HDR＋AgX、相機、物理 JS、selftest a–d
-- [ ] M2 大氣 LUT、天空、時間
-- [ ] M3 地形、水面
-- [ ] M4 設施、陰影
-- [ ] M5 體積煙流、霧、光柱
-- [ ] M6 夜間燈光、火炬
-- [ ] M7 分析模式、UI、selftest e
-- [ ] M8 平面反射、畫質分級、手機操作、bench、shot
+- [x] M1 骨架：WebGPU 初始化、WGSL 模組載入與 binding 反射、HDR＋AgX、相機、物理 JS、selftest a–d（全部 PASS）
+- [x] M2 大氣 LUT（transmittance／multi-scatter／sky-view）、環境光、雲、星、時間
+- [x] M3 地形（GPU 產生高度圖 → 回讀 → clipmap＋morph）、水面
+- [x] M4 設施（程序網格＋instancing＋程序材質）、cascaded shadow maps
+- [x] M5 體積煙流（密度函式、光學深度體積、raymarch、時間累積、合成）、大氣霧、bloom
+- [ ] M6 夜間燈光 sprite、地面光池、火炬火焰
+- [ ] M7 分析模式（compute 熱圖、等值線、測站、Cmax、剖面簾幕）、UI 面板、selftest e
+- [ ] M8 平面反射、畫質分級＋動態解析度、手機操作、bench、FXAA
 - [ ] 評審迴圈（最多 6 輪）
 - [ ] P1、P2
 - [ ] README、Artifact、最終報告
+
+## 目前的預設值與數字（之後調整要同步改這裡）
+- 預設：D 級、都市型、u10=3.5 m/s、風向 225°、煙囪 220／250／200 m、Q=150 g/s（每支）、Ts=55 °C、vs=20 m/s、d=8 m、Ta=26 °C、RH=95%。
+- 算出來：煙囪口風速約 7.8 m/s、最終浮升約 115–125 m、白煙可見長度約 330 m、xmax 約 2.5 km、Cmax 約 93 μg/m³。
+- RH 與白煙長度：60% → 約 85 m；85% → 約 145 m；95% → 約 265–330 m；98% → 約 440 m。
+- 開場鏡頭：相機 (2750, 地形+22, −150)、yaw 270°、pitch −1°、FOV 24°、時間 −16.7 分（太陽高度 3.76°、方位 267.5°）。
 
 ## 評審輪次
 （P0 完成後開始）
 
 ## 待修問題
-（無）
+- 前景鋪面太空、太平；地形的草地／樹林有規則的斑點（雜訊貼圖重複）。
+- 市鎮建築偏白、太方。
+- 煙流近看偏軟（像棉花），邊緣細節可以再銳利一點；迎光面顏色偏土黃。
+- 整體太橘，天空上方的藍紫色在開場鏡頭裡看不到（望遠鏡頭只看到低仰角）。
 
 ## 踩過的坑
-（邊做邊記）
+1. **WGSL：`fwidth`／`textureSample` 不能放在依 varying 分支的 `if` 裡**（uniform control flow）。先在分支外算好，或改用 `textureSampleLevel`。
+2. **uniform struct 的解析**：我的 `parseStruct` 原本一行抓一個欄位，`struct LVU { o: vec4f, u: vec4f, … }` 寫在同一行就只抓到第一個。已改成去掉註解後用全域 regex。
+3. **group 0 的成員要最早建立**：`common` 裡宣告的 uniform（Frame、Atmo、PlumeU）每個 pipeline 都會綁，包含啟動時產生地形的 pipeline。
+4. **同一張貼圖不能在同一個 pass 又當輸出又被綁定**：產生某張貼圖的 pass 不能 include `scene_tex`（裡面有那張貼圖）。光學深度體積的 compute pass 因此另外宣告自己的 group 1。
+5. **raymarch 的步長估計**（三個都造成過畫面上的直線或弧線）：
+   - 用「到上風平面的距離」當步長：視線貼著平面走時一直走小步，步數耗盡。改用到煙囪口的距離。
+   - 視線擦過煙流外框時估計距離趨近 0：加下限（局部粗細的 1/4）。
+   - 高斯尾巴在外框處硬切：加一個平滑收到 0 的窗函數。
+6. **雜訊八度交叉淡化要完全連續**：兩層的取樣座標只能差一個 2 倍縮放。多加了不同的時間位移，就會在「八度切換」的位置切出斷面。
+7. **光學深度體積的外框要抓緊**：原本用 4.2σ＋蜿蜒的保守外框，一格體素大到 8–24 m，靠近煙囪口的細煙流取樣不到。改成只包住混合比例高於凝結臨界值的範圍。另外，體積存的是到體素中心的累積值，查的時候要扣掉取樣點自己那格的一半。
+8. **霧裡的建築陰影（CSM）只在近處用**：遠處細長的影子在少量取樣下會變成雜線。
+9. **靠近煙囪的氣膠霾不能太濃**：為了讓遠處的霾看得到而把係數調大，結果近處的霾把白煙染髒、遮暗。已限制 `min(f, 0.03)`。
+10. **物理上的重點**：27 °C 的夏季空氣裡，55 °C 飽和的煙氣稀釋 10–50 倍就不再過飽和，所以白煙只有幾百公尺長。要更長只能靠更高的相對濕度。遠處看得到的是氣膠霾，不是水氣。
