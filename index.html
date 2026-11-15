@@ -1,0 +1,1545 @@
+<!doctype html>
+<!--
+════════════════════════════════════════════════════════════════════════════
+ 海港夕煙  Harbor Plume
+ 單一檔案 WebGPU 作品：臨海工業區的黃昏＋煙流擴散分析（高斯煙流模型）
+ 設計說明見 DESIGN.md；進度與踩過的坑見 PROGRESS.md。
+
+ 目錄（用編輯器搜尋「§」加代號可以跳到該段）
+ ───────────────────────────────────────────────────────────────────────────
+ §CSS        介面樣式
+ §HTML       canvas、介面、錯誤與不支援說明
+ §WGSL       著色器模組（每個模組一個 <script type="text/wgsl" id="…">）
+   common          每幀 uniform（Frame）、取樣器、雜湊與小工具
+   fullscreen      全螢幕三角形 vertex shader
+   sky_placeholder 骨架階段的暫用天空（M2 會換掉）
+   resolve         MSAA 自訂 resolve
+   post_final      曝光、AgX tone map、dithering、輸出到 canvas
+ §J0  設定、查詢參數、畫質等級表
+ §J1  數學工具
+ §J2  物理模型（JavaScript double 參考實作）
+ §J3  GPU 基礎建設：WGSL 前處理、binding 反射、pipeline、uniform buffer
+ §J4  render target 與共用資源
+ §J6  各個 pass
+ §J7  相機與輸入
+ §J8  介面
+ §J9  測試鉤子：?shot、?selftest、?bench、window.__scene
+ §J10 主迴圈與啟動
+════════════════════════════════════════════════════════════════════════════
+-->
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>海港夕煙</title>
+<style>
+/* §CSS ─────────────────────────────────────────────────────────────── */
+:root{
+  --ink:#ece6da; --ink-dim:#a9a396; --amber:#f0b25c; --cool:#8fb6d8;
+  --glass:rgba(13,15,20,.56); --line:rgba(255,255,255,.09);
+  --font:"Noto Sans TC","PingFang TC","Microsoft JhengHei",system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:#07080b;color:var(--ink);font-family:var(--font);
+  -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+#gfx{position:fixed;inset:0;width:100vw;height:100vh;height:100dvh;display:block;touch-action:none;outline:none}
+#fallback{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;
+  background:radial-gradient(120% 90% at 50% 100%,#3a2414 0%,#12131a 55%,#07080b 100%);z-index:50}
+#fallback[hidden]{display:none}
+#fallback .box{max-width:520px;line-height:1.75;font-size:16px}
+#fallback h1{font-size:22px;font-weight:600;margin:0 0 12px;color:var(--amber);letter-spacing:.08em}
+#fallback code{font-family:ui-monospace,Consolas,monospace;font-size:13px;color:var(--ink-dim);word-break:break-all}
+#dbg{position:fixed;left:8px;bottom:8px;max-width:min(92vw,900px);max-height:46vh;overflow:auto;z-index:60;
+  font:12px/1.45 ui-monospace,Consolas,monospace;color:#ffd9d0;background:rgba(40,8,8,.82);border:1px solid #a33;
+  padding:8px 10px;white-space:pre-wrap;border-radius:6px;-webkit-user-select:text;user-select:text}
+#dbg[hidden]{display:none}
+#stat{position:fixed;right:10px;bottom:8px;z-index:20;font:11px/1.4 ui-monospace,Consolas,monospace;color:var(--ink-dim);
+  text-align:right;pointer-events:none;text-shadow:0 1px 2px #000}
+#stat[hidden]{display:none}
+</style>
+</head>
+<body>
+<!-- §HTML ─────────────────────────────────────────────────────────── -->
+<canvas id="gfx" tabindex="0" aria-label="海港夕煙 3D 場景。點一下畫面後可用 W A S D 移動、滑鼠轉視角。"></canvas>
+
+<div id="fallback" hidden role="alert">
+  <div class="box">
+    <h1>海港夕煙</h1>
+    <p id="fallbackMsg">這個瀏覽器不支援 WebGPU，所以畫面無法顯示。<br>請改用最新版的 Chrome 或 Edge，或 Safari 26 以上的版本。</p>
+    <p><code id="fallbackDetail"></code></p>
+  </div>
+</div>
+<div id="dbg" hidden></div>
+<div id="stat" hidden></div>
+<!-- @@UI-END -->
+
+<!-- §WGSL ─────────────────────────────────────────────────────────── -->
+
+<script type="text/wgsl" id="common">
+// ── common：每幀 uniform、取樣器、小工具 ──
+// 注意：uniform struct 只用 vec4f 與 mat4x4f（都對齊 16 bytes），JS 端會解析這個 struct 自動算位移。
+struct Frame {
+  viewProj: mat4x4f,
+  prevViewProj: mat4x4f,
+  camPos: vec4f,     // xyz 世界座標（m），w = near
+  camRight: vec4f,   // xyz，w = tan(水平視角/2)
+  camUp: vec4f,      // xyz，w = tan(垂直視角/2)
+  camFwd: vec4f,     // xyz，w 預留
+  viewport: vec4f,   // 內部解析度 w, h, 1/w, 1/h
+  sunDir: vec4f,     // xyz 指向太陽，w = 太陽高度角（rad）
+  sunIllum: vec4f,   // rgb 地面的太陽照度，w = 夜間係數 0..1
+  time: vec4f,       // x 模擬時間（s），y 幀序號，z 分析模式係數 0..1，w 預留
+};
+// 大氣參數（長度單位：公里）
+struct Atmo {
+  rayleigh: vec4f,   // rgb 海平面散射係數 [/km]，w = 尺度高 [km]
+  mie: vec4f,        // x 散射、y 吸收 [/km]，z 尺度高 [km]，w 相位函數 g
+  ozone: vec4f,      // rgb 吸收係數 [/km]
+  haze: vec4f,       // 近地霾：x 散射、w 吸收 [/km]，y 尺度高 [km]
+  sunE: vec4f,       // rgb 大氣層頂的太陽照度（相對單位），w = 太陽視半徑 [rad]
+  misc: vec4f,       // x 地面反照率，y 相機高度 [km]，z 雲量 0..1，w 日面輝度上限
+};
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var sLin: sampler;
+@group(0) @binding(2) var sRep: sampler;
+@group(0) @binding(3) var sNear: sampler; // @nonfiltering
+@group(0) @binding(4) var<uniform> A: Atmo;
+
+const PI: f32 = 3.14159265358979;
+const TAU: f32 = 6.28318530717959;
+
+fn saturate(x: f32) -> f32 { return clamp(x, 0.0, 1.0); }
+fn sat3(x: vec3f) -> vec3f { return clamp(x, vec3f(0.0), vec3f(1.0)); }
+fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
+
+// 整數雜湊（PCG 風格）→ [0,1)
+fn hashU(x: u32) -> u32 {
+  var v = x * 747796405u + 2891336453u;
+  let w = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+fn hash21(p: vec2f) -> f32 {
+  let q = vec2u(vec2i(floor(p)));
+  return f32(hashU(q.x ^ hashU(q.y))) * (1.0 / 4294967296.0);
+}
+fn hash31(p: vec3f) -> f32 {
+  let q = vec3u(vec3i(floor(p)));
+  return f32(hashU(q.x ^ hashU(q.y ^ hashU(q.z)))) * (1.0 / 4294967296.0);
+}
+// Interleaved Gradient Noise（Jimenez 2014）：搭配每幀位移，時間累積後接近 blue noise
+fn ign(pix: vec2f, frame: f32) -> f32 {
+  let p = pix + 5.588238 * (frame % 64.0);
+  return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715))));
+}
+// 從螢幕 uv（左上原點）取得世界空間視線方向（未正規化，沿 camFwd 的分量為 1）
+fn viewRay(uv: vec2f) -> vec3f {
+  let ndc = vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  return F.camFwd.xyz + F.camRight.xyz * (ndc.x * F.camRight.w) + F.camUp.xyz * (ndc.y * F.camUp.w);
+}
+// reversed-Z 無限遠投影：深度值 → 沿 camFwd 的線性距離（m）
+fn linDepth(d: f32) -> f32 { return F.camPos.w / max(d, 1e-9); }
+</script>
+
+<script type="text/wgsl" id="fullscreen">
+// ── fullscreen：一個涵蓋整個畫面的三角形 ──
+struct FSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> FSOut {
+  var o: FSOut;
+  let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+  o.pos = vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+  o.uv = vec2f(p.x, 1.0 - p.y);
+  return o;
+}
+</script>
+
+<script type="text/wgsl" id="atmo_fn">
+// ── atmo_fn：大氣介質與查表座標（Hillaire 2020；長度單位公里）。不存取貼圖 ──
+const RG: f32 = 6360.0;     // 地球半徑
+const RTOP: f32 = 6460.0;   // 大氣頂
+// 射線與球（球心在原點）的兩個交點距離；沒有交點回傳 (-1,-1)
+fn raySphere(ro: vec3f, rd: vec3f, rad: f32) -> vec2f {
+  let b = dot(ro, rd);
+  let c = dot(ro, ro) - rad * rad;
+  let h = b * b - c;
+  if (h < 0.0) { return vec2f(-1.0); }
+  let s = sqrt(h);
+  return vec2f(-b - s, -b + s);
+}
+struct Medium { scatR: vec3f, scatM: f32, ext: vec3f };
+fn medium(h: f32) -> Medium {
+  let dR = exp(-h / A.rayleigh.w);
+  let dM = exp(-h / A.mie.z);
+  let dH = exp(-h / A.haze.y);
+  let dO = max(0.0, 1.0 - abs(h - 25.0) / 15.0);
+  var m: Medium;
+  m.scatR = A.rayleigh.rgb * dR;
+  m.scatM = A.mie.x * dM + A.haze.x * dH;
+  m.ext = m.scatR + vec3f(m.scatM + A.mie.y * dM + A.haze.w * dH) + A.ozone.rgb * dO;
+  return m;
+}
+fn phaseR(c: f32) -> f32 { return 3.0 / (16.0 * PI) * (1.0 + c * c); }
+fn phaseM(c: f32, g: f32) -> f32 {   // Cornette-Shanks
+  let g2 = g * g;
+  return 3.0 / (8.0 * PI) * (1.0 - g2) * (1.0 + c * c) / ((2.0 + g2) * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
+}
+fn hg(c: f32, g: f32) -> f32 {       // Henyey-Greenstein
+  let g2 = g * g;
+  return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
+}
+// transmittance LUT 參數化（Bruneton）：(r, mu) ↔ uv
+fn transUv(r: f32, mu: f32) -> vec2f {
+  let H = sqrt(RTOP * RTOP - RG * RG);
+  let rho = sqrt(max(r * r - RG * RG, 0.0));
+  let disc = r * r * (mu * mu - 1.0) + RTOP * RTOP;
+  let d = max(0.0, -r * mu + sqrt(max(disc, 0.0)));
+  let dmin = RTOP - r;
+  let dmax = rho + H;
+  return vec2f((d - dmin) / (dmax - dmin), rho / H);
+}
+fn transUvToRMu(uv: vec2f) -> vec2f {
+  let H = sqrt(RTOP * RTOP - RG * RG);
+  let rho = H * uv.y;
+  let r = sqrt(rho * rho + RG * RG);
+  let dmin = RTOP - r;
+  let dmax = rho + H;
+  let d = dmin + uv.x * (dmax - dmin);
+  var mu = 1.0;
+  if (d > 0.0) { mu = (H * H - rho * rho - d * d) / (2.0 * r * d); }
+  return vec2f(r, clamp(mu, -1.0, 1.0));
+}
+</script>
+
+<script type="text/wgsl" id="atmo_lut_fn">
+// ── atmo_lut_fn：查 transmittance LUT（需要先宣告 transLUT）──
+fn transmittance(r: f32, mu: f32) -> vec3f {
+  let uv = transUv(r, mu);
+  return textureSampleLevel(transLUT, sLin, (uv * vec2f(255.0, 63.0) + 0.5) / vec2f(256.0, 64.0), 0.0).rgb;
+}
+// 從半徑 r 的點看太陽（天頂角餘弦 mu）的透射率；被地球擋住時為 0
+fn transToSun(r: f32, mu: f32) -> vec3f {
+  let hc = -sqrt(max(1.0 - (RG / r) * (RG / r), 0.0));
+  return transmittance(r, mu) * smoothstep(-0.004, 0.004, mu - hc);
+}
+</script>
+
+<script type="text/wgsl" id="lut_trans">
+// ── lut_trans：transmittance LUT（256×64）──
+#include common
+#include fullscreen
+#include atmo_fn
+@fragment fn fs(in: FSOut) -> @location(0) vec4f {
+  let uv = (in.pos.xy - 0.5) / vec2f(255.0, 63.0);
+  let rm = transUvToRMu(uv);
+  let ro = vec3f(0.0, rm.x, 0.0);
+  let rd = vec3f(sqrt(max(1.0 - rm.y * rm.y, 0.0)), rm.y, 0.0);
+  let tTop = raySphere(ro, rd, RTOP).y;
+  var od = vec3f(0.0);
+  let N = 48;
+  for (var i = 0; i < N; i++) {   // 取樣點往起點加密（近地霾的尺度高很小）
+    let a = f32(i) / f32(N);
+    let b = f32(i + 1) / f32(N);
+    let t0 = a * a * tTop;
+    let t1 = b * b * tTop;
+    let p = ro + rd * (0.5 * (t0 + t1));
+    od += medium(max(length(p) - RG, 0.0)).ext * (t1 - t0);
+  }
+  return vec4f(exp(-od), 1.0);
+}
+</script>
+
+<script type="text/wgsl" id="lut_ms">
+// ── lut_ms：多重散射 LUT（32×32；u = 太陽天頂角餘弦，v = 高度）──
+#include common
+#include fullscreen
+#include atmo_fn
+@group(1) @binding(0) var transLUT: texture_2d<f32>;
+#include atmo_lut_fn
+@fragment fn fs(in: FSOut) -> @location(0) vec4f {
+  let uv = (in.pos.xy - 0.5) / 31.0;
+  let muS = uv.x * 2.0 - 1.0;
+  let r = RG + 0.01 + uv.y * (RTOP - RG - 0.02);
+  let sun = vec3f(sqrt(max(1.0 - muS * muS, 0.0)), muS, 0.0);
+  let ro = vec3f(0.0, r, 0.0);
+  var L2 = vec3f(0.0);
+  var fms = vec3f(0.0);
+  let SQ = 8;
+  let NS = 20;
+  for (var i = 0; i < SQ; i++) {
+    for (var j = 0; j < SQ; j++) {
+      let th = TAU * (f32(i) + 0.5) / f32(SQ);
+      let cph = 1.0 - 2.0 * (f32(j) + 0.5) / f32(SQ);
+      let sph = sqrt(max(1.0 - cph * cph, 0.0));
+      let rd = vec3f(sph * cos(th), cph, sph * sin(th));
+      let tg = raySphere(ro, rd, RG);
+      var tMax = raySphere(ro, rd, RTOP).y;
+      let hit = tg.x > 0.0;
+      if (hit) { tMax = tg.x; }
+      var T = vec3f(1.0);
+      var Li = vec3f(0.0);
+      var Lf = vec3f(0.0);
+      let dt = tMax / f32(NS);
+      for (var s = 0; s < NS; s++) {
+        let p = ro + rd * ((f32(s) + 0.3) * dt);
+        let rr = length(p);
+        let m = medium(max(rr - RG, 0.0));
+        let sT = exp(-m.ext * dt);
+        let scat = m.scatR + vec3f(m.scatM);
+        let Ts = transToSun(rr, dot(p / rr, sun));
+        let S = Ts * scat * (1.0 / (4.0 * PI));
+        Li += T * (S - S * sT) / max(m.ext, vec3f(1e-7));
+        Lf += T * (scat - scat * sT) / max(m.ext, vec3f(1e-7));
+        T *= sT;
+      }
+      if (hit) {   // 地面反射的一次散射
+        let pg = ro + rd * tMax;
+        let n = normalize(pg);
+        let nl = saturate(dot(n, sun));
+        Li += T * transToSun(RG + 0.001, dot(n, sun)) * nl * A.misc.x / PI;
+      }
+      L2 += Li;
+      fms += Lf;
+    }
+  }
+  let inv = 1.0 / f32(SQ * SQ);
+  L2 *= inv;
+  fms *= inv;
+  return vec4f(L2 / (vec3f(1.0) - fms), 1.0);
+}
+</script>
+
+<script type="text/wgsl" id="sky_lut_map">
+// ── sky_lut_map：sky-view LUT 的方向 ↔ uv（緯度在地平線附近加密；方位相對太陽、左右對稱）──
+const SKY_W: f32 = 192.0;
+const SKY_H: f32 = 108.0;
+fn skyHorizon() -> vec2f {   // (zenith 到地平線的角度, beta)
+  let r = RG + A.misc.y;
+  let beta = acos(clamp(sqrt(max(r * r - RG * RG, 0.0)) / r, 0.0, 1.0));
+  return vec2f(PI - beta, beta);
+}
+fn skyUv(dir: vec3f) -> vec2f {
+  let hz = skyHorizon();
+  let ang = acos(clamp(dir.y, -1.0, 1.0));
+  var v: f32;
+  if (ang < hz.x) { v = (1.0 - sqrt(max(1.0 - ang / hz.x, 0.0))) * 0.5; }
+  else { v = sqrt(saturate((ang - hz.x) / hz.y)) * 0.5 + 0.5; }
+  let dh = dir.xz / max(length(dir.xz), 1e-5);
+  let sh = F.sunDir.xz / max(length(F.sunDir.xz), 1e-5);
+  let u = acos(clamp(dot(dh, sh), -1.0, 1.0)) / PI;
+  return vec2f((u * (SKY_W - 1.0) + 0.5) / SKY_W, (v * (SKY_H - 1.0) + 0.5) / SKY_H);
+}
+</script>
+
+<script type="text/wgsl" id="lut_sky">
+// ── lut_sky：sky-view LUT（192×108，每幀更新）──
+#include common
+#include fullscreen
+#include atmo_fn
+@group(1) @binding(0) var transLUT: texture_2d<f32>;
+@group(1) @binding(1) var msLUT: texture_2d<f32>;
+#include atmo_lut_fn
+#include sky_lut_map
+@fragment fn fs(in: FSOut) -> @location(0) vec4f {
+  let uv = (in.pos.xy - 0.5) / vec2f(SKY_W - 1.0, SKY_H - 1.0);
+  let hz = skyHorizon();
+  var ang: f32;
+  if (uv.y < 0.5) { var c = 1.0 - 2.0 * uv.y; c = 1.0 - c * c; ang = hz.x * c; }
+  else { var c = uv.y * 2.0 - 1.0; c = c * c; ang = hz.x + hz.y * c; }
+  let phi = uv.x * PI;
+  let rd = vec3f(sin(ang) * cos(phi), cos(ang), sin(ang) * sin(phi));
+  let el = F.sunDir.w;
+  let sun = vec3f(cos(el), sin(el), 0.0);
+  let r = RG + A.misc.y;
+  let ro = vec3f(0.0, r, 0.0);
+  let tg = raySphere(ro, rd, RG);
+  var tMax = raySphere(ro, rd, RTOP).y;
+  if (tg.x > 0.0) { tMax = tg.x; }
+  let cosT = dot(rd, sun);
+  let pR = phaseR(cosT);
+  let pM = phaseM(cosT, A.mie.w);
+  var T = vec3f(1.0);
+  var L = vec3f(0.0);
+  let N = 32;
+  for (var i = 0; i < N; i++) {
+    var t0 = f32(i) / f32(N);
+    var t1 = f32(i + 1) / f32(N);
+    t0 = t0 * t0; t1 = t1 * t1;
+    let t = tMax * (t0 + (t1 - t0) * 0.3);
+    let dt = tMax * (t1 - t0);
+    let p = ro + rd * t;
+    let rr = length(p);
+    let m = medium(max(rr - RG, 0.0));
+    let sT = exp(-m.ext * dt);
+    let muS = dot(p / rr, sun);
+    let Ts = transToSun(rr, muS);
+    let ms = textureSampleLevel(msLUT, sLin, vec2f(muS * 0.5 + 0.5, saturate((rr - RG) / (RTOP - RG))), 0.0).rgb;
+    let S = A.sunE.rgb * (Ts * (m.scatR * pR + vec3f(m.scatM * pM)) + ms * (m.scatR + vec3f(m.scatM)));
+    L += T * (S - S * sT) / max(m.ext, vec3f(1e-7));
+    T *= sT;
+  }
+  return vec4f(L, 1.0);
+}
+</script>
+
+<script type="text/wgsl" id="amb_cube">
+// ── amb_cube：天空環境光（6 個軸向的餘弦加權平均輝度，6×1）──
+#include common
+#include fullscreen
+#include atmo_fn
+@group(1) @binding(0) var skyLUT: texture_2d<f32>;
+#include sky_lut_map
+@fragment fn fs(in: FSOut) -> @location(0) vec4f {
+  let k = i32(in.pos.x);
+  var n = vec3f(1.0, 0.0, 0.0);
+  if (k == 1) { n = vec3f(-1.0, 0.0, 0.0); }
+  if (k == 2) { n = vec3f(0.0, 1.0, 0.0); }
+  if (k == 3) { n = vec3f(0.0, -1.0, 0.0); }
+  if (k == 4) { n = vec3f(0.0, 0.0, 1.0); }
+  if (k == 5) { n = vec3f(0.0, 0.0, -1.0); }
+  let t = normalize(cross(n, select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(n.y) > 0.5)));
+  let b = cross(n, t);
+  var acc = vec3f(0.0);
+  let N = 64;
+  for (var i = 0; i < N; i++) {
+    let u = (f32(i) + 0.5) / f32(N);
+    let ph = TAU * fract(f32(i) * 0.61803399);
+    let ct = sqrt(1.0 - u);
+    let st = sqrt(u);
+    var d = t * (st * cos(ph)) + b * (st * sin(ph)) + n * ct;
+    var w = 1.0;
+    if (d.y < 0.0) { d.y = 0.02; d = normalize(d); w = 0.3; }   // 地平線以下：用地平線天色的 0.3 倍近似地面反光
+    acc += textureSampleLevel(skyLUT, sLin, skyUv(d), 0.0).rgb * w;
+  }
+  return vec4f(acc / f32(N), 1.0);
+}
+</script>
+
+<script type="text/wgsl" id="scene_tex">
+// ── scene_tex：場景共用貼圖（group 1）。產生這些貼圖的 pass 不能 include 這個模組 ──
+@group(1) @binding(0) var transLUT: texture_2d<f32>;
+@group(1) @binding(1) var msLUT: texture_2d<f32>;
+@group(1) @binding(2) var skyLUT: texture_2d<f32>;
+@group(1) @binding(3) var ambCube: texture_2d<f32>;
+@group(1) @binding(4) var noise2D: texture_2d<f32>;
+</script>
+
+<script type="text/wgsl" id="sky_fn">
+// ── sky_fn：天空顏色（LUT＋雲＋日面＋星）與環境光。需要 scene_tex、atmo_fn、atmo_lut_fn、sky_lut_map ──
+fn skyLutSample(dir: vec3f) -> vec3f {
+  return textureSampleLevel(skyLUT, sLin, skyUv(dir), 0.0).rgb;
+}
+// 天空環境光：依法線在 6 個軸向之間內插（ambient cube）
+fn ambient(n: vec3f) -> vec3f {
+  let n2 = n * n;
+  let ix = select(1, 0, n.x >= 0.0);
+  let iy = select(3, 2, n.y >= 0.0);
+  let iz = select(5, 4, n.z >= 0.0);
+  return n2.x * textureLoad(ambCube, vec2i(ix, 0), 0).rgb + n2.y * textureLoad(ambCube, vec2i(iy, 0), 0).rgb
+       + n2.z * textureLoad(ambCube, vec2i(iz, 0), 0).rgb;
+}
+// 一層薄雲。回傳 (rgb 顏色, a 遮蔽量)
+fn cloudLayer(dir: vec3f, altKm: f32, scale: vec2f, drift: vec2f, cover: f32, soft: f32) -> vec4f {
+  let r = RG + A.misc.y;
+  let ro = vec3f(0.0, r, 0.0);
+  let t = raySphere(ro, dir, RG + altKm).y;
+  if (dir.y <= 0.002 || t <= 0.0) { return vec4f(0.0); }
+  let w = F.camPos.xz * 0.001 + dir.xz * t;
+  let uv = w * scale + drift * (F.time.x * 0.0004);
+  let n1 = textureSampleLevel(noise2D, sRep, uv, 0.0);
+  let n2 = textureSampleLevel(noise2D, sRep, uv * 3.3 + n1.gr * 0.12, 0.0);
+  let n3 = textureSampleLevel(noise2D, sRep, uv * 11.0 + n2.rg * 0.05, 0.0);
+  var d = n1.r * 0.62 + n2.g * 0.28 + n3.r * 0.10;
+  d = smoothstep(1.0 - cover, 1.0 - cover + soft, d);
+  if (d <= 0.0) { return vec4f(0.0); }
+  // 雲的位置看太陽：越晚越紅，被地球擋住就暗掉
+  let pc = ro + dir * t;
+  let rc = length(pc);
+  let sunL = normalize(vec3f(F.sunDir.x, F.sunDir.y, F.sunDir.z));
+  let muS = dot(pc / rc, sunL);
+  let sunC = A.sunE.rgb * transToSun(rc, muS);
+  let cosS = dot(dir, sunL);
+  let fwd = hg(cosS, 0.72) * 3.0 + hg(cosS, 0.25) * 2.0 + 0.10;
+  let thin = 1.0 - 0.75 * d;                     // 厚的地方自己遮光
+  let amb = skyLutSample(vec3f(0.0, 1.0, 0.0)) * 1.6 + skyLutSample(normalize(vec3f(dir.x, 0.25, dir.z))) * 0.5;
+  let col = sunC * fwd * thin * 0.55 + amb * (0.35 + 0.4 * d);
+  // 相機到雲之間的透射率：T(相機, 方向) / T(雲, 方向)
+  let Tv = transmittance(r, dir.y) / max(transmittance(rc, dot(pc / rc, dir)), vec3f(1e-4));
+  let fade = saturate(luma(Tv) * 1.15) * smoothstep(0.002, 0.05, dir.y);
+  return vec4f(col, d * fade);
+}
+fn stars(dir: vec3f) -> f32 {
+  let p = dir * 220.0;
+  let id = floor(p);
+  let h = hash31(id + 500.0);
+  if (h < 0.992) { return 0.0; }
+  let c = id + 0.5 + (vec3f(hash31(id + 11.0), hash31(id + 23.0), hash31(id + 37.0)) - 0.5) * 0.6;
+  let d = length(p - c);
+  return smoothstep(0.42, 0.0, d) * (0.3 + 3.0 * pow(hash31(id + 71.0), 6.0));
+}
+fn skyColor(dir: vec3f, withSun: f32) -> vec3f {
+  var L = skyLutSample(dir);
+  let night = F.sunIllum.w;
+  // 夜空底色（大氣輝光＋月光散射的近似）與地平線的城市光害
+  let hor = 1.0 - saturate(dir.y);
+  L += vec3f(0.010, 0.016, 0.034) * night * (0.35 + 0.65 * hor * hor) * 0.012;
+  L += vec3f(1.0, 0.62, 0.30) * night * pow(hor, 10.0) * 0.00045;
+  if (dir.y > -0.02) {
+    L += vec3f(0.9, 0.95, 1.0) * stars(dir) * night * 0.0035 * smoothstep(0.0, 0.25, dir.y);
+    let cov = A.misc.z;
+    // 高層卷雲（拉長）與中層碎雲
+    let c1 = cloudLayer(dir, 9.5, vec2f(0.012, 0.034), vec2f(0.6, 0.2), cov * 0.62, 0.42);
+    L = mix(L, c1.rgb, c1.a * 0.85);
+    let c2 = cloudLayer(dir, 4.2, vec2f(0.045, 0.060), vec2f(1.0, -0.4), cov * 0.50, 0.22);
+    L = mix(L, c2.rgb, c2.a * 0.92);
+  }
+  // 日面（含周邊減光）；輝度有上限，避免 bloom 失控
+  let sunL = F.sunDir.xyz;
+  let ang = length(cross(dir, sunL));
+  let rad = A.sunE.w;
+  if (withSun > 0.0 && dot(dir, sunL) > 0.0 && ang < rad * 1.6) {
+    let r = RG + A.misc.y;
+    let x = saturate(ang / rad);
+    let limb = 1.0 - 0.55 * (1.0 - sqrt(max(1.0 - x * x, 0.0)));
+    let disc = smoothstep(rad * 1.04, rad * 0.94, ang);
+    let Ls = A.sunE.rgb * transToSun(r, dir.y) / (PI * rad * rad);
+    L += min(Ls * limb, vec3f(A.misc.w)) * disc * withSun;
+  }
+  return L;
+}
+</script>
+
+<script type="text/wgsl" id="sky">
+// ── sky：主場景裡的天空（畫在最遠處）──
+#include common
+#include fullscreen
+#include atmo_fn
+#include scene_tex
+#include atmo_lut_fn
+#include sky_lut_map
+#include sky_fn
+@fragment fn fs(in: FSOut) -> @location(0) vec4f {
+  let rd = normalize(viewRay(in.uv));
+  var col = skyColor(rd, 1.0);
+  // M2 暫用：格線地面（M3 換成地形與水面）
+  let ro = F.camPos.xyz;
+  let tg = -ro.y / min(rd.y, -1e-5);
+  let pg = ro + rd * tg;
+  let fw = fwidth(pg.xz / 500.0);
+  if (rd.y < 0.0) {
+    let g = abs(fract(pg.xz / 500.0 - 0.5) - 0.5) / fw;
+    let line = 1.0 - saturate(min(g.x, g.y));
+    let n = vec3f(0.0, 1.0, 0.0);
+    let ground = (vec3f(0.12) + vec3f(0.3) * line) * (ambient(n) + F.sunIllum.rgb * max(F.sunDir.y, 0.0) / PI);
+    col = mix(ground, col, saturate(tg / 30000.0));
+  }
+  return vec4f(col, 1.0);
+}
+</script>
+
+<script type="text/wgsl" id="resolve">
+// ── resolve：MSAA 自訂 resolve。用可逆 tone map 的權重平均，避免超亮像素讓邊緣鋸齒 ──
+#include common
+#include fullscreen
+@group(1) @binding(0) var msTex: texture_multisampled_2d<f32>;
+@fragment fn fs(in: FSOut) -> @location(0) vec4f {
+  let p = vec2i(in.pos.xy);
+  var acc = vec3f(0.0);
+  var wsum = 0.0;
+  for (var i = 0; i < 4; i++) {
+    let c = textureLoad(msTex, p, i).rgb;
+    let w = 1.0 / (1.0 + luma(max(c, vec3f(0.0))) * F.camFwd.w);
+    acc += c * w;
+    wsum += w;
+  }
+  return vec4f(acc / wsum, 1.0);
+}
+</script>
+
+<script type="text/wgsl" id="post_final">
+// ── post_final：曝光 → AgX → 調色 → dithering → canvas ──
+#include common
+#include fullscreen
+struct PostU {
+  p0: vec4f,   // x 曝光倍率，y bloom 強度，z 去飽和（分析模式），w 暗角強度
+  p1: vec4f,   // x canvas 寬，y canvas 高，z 幀序號，w 預留
+};
+@group(1) @binding(0) var<uniform> P: PostU;
+@group(1) @binding(1) var hdrTex: texture_2d<f32>;
+@group(1) @binding(2) var bloomTex: texture_2d<f32>;
+
+// AgX（Troy Sobotka）；這裡用 Benjamin Wrensch 的精簡近似版
+fn agxContrast(x: vec3f) -> vec3f {
+  let x2 = x * x; let x4 = x2 * x2;
+  return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232;
+}
+fn agx(c: vec3f) -> vec3f {
+  let m = mat3x3f(0.842479062253094, 0.0423282422610123, 0.0423756549057051,
+                  0.0784335999999992, 0.878468636469772, 0.0784336,
+                  0.0792237451477643, 0.0791661274605434, 0.879142973793104);
+  let minEv = -12.47393; let maxEv = 4.026069;
+  var v = m * c;
+  v = clamp(log2(max(v, vec3f(1e-10))), vec3f(minEv), vec3f(maxEv));
+  v = (v - minEv) / (maxEv - minEv);
+  return agxContrast(v);
+}
+fn agxLook(c: vec3f) -> vec3f {
+  // 稍微加對比與飽和（介於預設與 punchy 之間）
+  var v = pow(max(c, vec3f(0.0)), vec3f(1.18));
+  let l = luma(v);
+  return l + 1.22 * (v - l);
+}
+fn agxEotf(c: vec3f) -> vec3f {
+  let m = mat3x3f(1.19687900512017, -0.0528968517574562, -0.0529716355144438,
+                  -0.0980208811401368, 1.15190312990417, -0.0980434501171241,
+                  -0.0990297440797205, -0.0989611768448433, 1.15107367264116);
+  return pow(max(m * c, vec3f(0.0)), vec3f(2.2));
+}
+fn toSrgb(c: vec3f) -> vec3f {
+  let lo = c * 12.92;
+  let hi = 1.055 * pow(max(c, vec3f(0.0)), vec3f(1.0 / 2.4)) - 0.055;
+  return select(hi, lo, c <= vec3f(0.0031308));
+}
+@fragment fn fs(in: FSOut) -> @location(0) vec4f {
+  var c = max(textureSampleLevel(hdrTex, sLin, in.uv, 0.0).rgb, vec3f(0.0));
+  let b = max(textureSampleLevel(bloomTex, sLin, in.uv, 0.0).rgb, vec3f(0.0));
+  c = mix(c, b, P.p0.y) * P.p0.x;
+  // 暗角
+  let q = in.uv - 0.5;
+  c *= 1.0 - P.p0.w * smoothstep(0.25, 0.95, dot(q, q) * 2.0);
+  var o = agxEotf(agxLook(agx(c)));
+  // 分析模式：去飽和
+  o = mix(o, vec3f(luma(o)), P.p0.z);
+  o = toSrgb(o);
+  // 三角分佈 dithering，消除 8-bit 色帶
+  let n1 = hash21(in.pos.xy + vec2f(P.p1.z * 13.0, 7.0));
+  let n2 = hash21(in.pos.xy + vec2f(91.0, P.p1.z * 17.0 + 3.0));
+  o += (n1 + n2 - 1.0) / 255.0;
+  return vec4f(o, 1.0);
+}
+</script>
+<!-- @@WGSL-END -->
+
+<script>
+'use strict';
+// ═══ §J0 設定、查詢參數、畫質等級表 ═══════════════════════════════════
+const QS = new URLSearchParams(location.search);
+const CFG = {
+  shot: Math.max(0, Math.min(6, parseInt(QS.get('shot') || '0', 10) || 0)),
+  selftest: QS.get('selftest') === '1',
+  bench: QS.get('bench') === '1',
+  debug: QS.get('debug') === '1',
+  q: QS.get('q'),
+};
+const TIERS = {
+  ultra:  {name:'ultra',  msaa:4, maxScale:1.0,  minScale:0.7,  shadowN:4, shadowRes:2048, pcf:16, volDiv:2, volSteps:96, fogSteps:24, lvol:[192,96,64], lvolEvery:1, reflDiv:2, reflLevel:3, terrN:128, bloomMips:7, lightFrac:1.0, birds:2000},
+  high:   {name:'high',   msaa:4, maxScale:1.0,  minScale:0.6,  shadowN:3, shadowRes:2048, pcf:9,  volDiv:2, volSteps:64, fogSteps:16, lvol:[160,80,48],  lvolEvery:2, reflDiv:2, reflLevel:3, terrN:96,  bloomMips:6, lightFrac:1.0, birds:2000},
+  medium: {name:'medium', msaa:1, maxScale:0.85, minScale:0.5,  shadowN:3, shadowRes:1024, pcf:4,  volDiv:3, volSteps:40, fogSteps:12, lvol:[128,64,32],  lvolEvery:3, reflDiv:4, reflLevel:2, terrN:64,  bloomMips:5, lightFrac:0.7, birds:600},
+  low:    {name:'low',    msaa:1, maxScale:0.7,  minScale:0.45, shadowN:2, shadowRes:1024, pcf:4,  volDiv:4, volSteps:28, fogSteps:8,  lvol:[96,48,24],   lvolEvery:4, reflDiv:4, reflLevel:1, terrN:48,  bloomMips:5, lightFrac:0.5, birds:300},
+};
+let TIER = TIERS.high;
+
+// 預設物理參數（理由見 DESIGN.md §4）
+const DEFAULTS = {
+  u10: 3.5,        // 10 m 高度風速 [m/s]
+  windFrom: 225,   // 風向（來向）[°]，225 = 西南風
+  cls: 'D',        // 大氣穩定度 A–F
+  urban: true,     // 都市型擴散參數
+  hs: 250,         // 最高那支煙囪的高度 [m]
+  Q: 150,          // 每支煙囪的排放量 [g/s]
+  Ts: 55,          // 排氣溫度 [°C]
+  vs: 18,          // 排氣速度 [m/s]
+  d: 7,            // 煙囪出口內徑 [m]（固定）
+  Ta: 27,          // 氣溫 [°C]
+  lid: false,      // 逆溫層
+  zi: 800,         // 混合層高度 [m]
+  rh: 85,          // 相對濕度 [%]
+  thresh: 50,      // 門檻線 [μg/m³]（示意值）
+};
+
+// 全域狀態
+const S = {
+  cam: {pos:[2750, 128, -150], yaw: 266 * Math.PI / 180, pitch: -1.0 * Math.PI / 180, fov: 24 * Math.PI / 180, fovTarget: 24 * Math.PI / 180, speed: 60, vel:[0,0,0]},
+  timeMin: -16,          // 相對日落的分鐘數（負值＝日落前）
+  simTime: 0, frame: 0, frozen: false,
+  mode: 0, modeK: 0,     // 0 景觀、1 分析；modeK 是平滑過場係數
+  params: {...DEFAULTS},
+  renderScale: 1, userActed: false, resetDt: true, lastT: 0,
+  errors: [],
+};
+window.__errors = S.errors;
+
+// ═══ §J1 數學工具 ═════════════════════════════════════════════════════
+const $ = (s) => document.querySelector(s);
+const DEG = Math.PI / 180;
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const v3 = {
+  add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]],
+  sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]],
+  scale: (a, s) => [a[0] * s, a[1] * s, a[2] * s],
+  dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
+  cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+  len: (a) => Math.hypot(a[0], a[1], a[2]),
+  norm: (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; },
+  lerp: (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t],
+};
+// 矩陣：Float32Array(16)，column-major（和 WGSL mat4x4f 一致）
+const m4 = {
+  ident() { const m = new Float32Array(16); m[0] = m[5] = m[10] = m[15] = 1; return m; },
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+      let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+      o[c * 4 + r] = s;
+    }
+    return o;
+  },
+  // reversed-Z、無限遠平面的透視投影（near 映到 1，無限遠映到 0）
+  perspRevInf(fovy, aspect, near) {
+    const f = 1 / Math.tan(fovy / 2), m = new Float32Array(16);
+    m[0] = f / aspect; m[5] = f; m[11] = -1; m[14] = near;
+    return m;
+  },
+  // 正交投影，深度 0..1（陰影用）
+  ortho(l, r, b, t, n, f) {
+    const m = new Float32Array(16);
+    m[0] = 2 / (r - l); m[5] = 2 / (t - b); m[10] = -1 / (f - n);
+    m[12] = -(r + l) / (r - l); m[13] = -(t + b) / (t - b); m[14] = -n / (f - n); m[15] = 1;
+    return m;
+  },
+  // 由位置與基底（right, up, fwd）組 view 矩陣
+  viewBasis(p, r, u, f) {
+    const m = new Float32Array(16);
+    m[0] = r[0]; m[1] = u[0]; m[2] = -f[0];
+    m[4] = r[1]; m[5] = u[1]; m[6] = -f[1];
+    m[8] = r[2]; m[9] = u[2]; m[10] = -f[2];
+    m[12] = -v3.dot(r, p); m[13] = -v3.dot(u, p); m[14] = v3.dot(f, p); m[15] = 1;
+    return m;
+  },
+  lookAt(eye, target, up) {
+    const f = v3.norm(v3.sub(target, eye)), r = v3.norm(v3.cross(f, up)), u = v3.cross(r, f);
+    return m4.viewBasis(eye, r, u, f);
+  },
+  invert(a) {
+    const o = new Float32Array(16);
+    const a00 = a[0], a01 = a[1], a02 = a[2], a03 = a[3], a10 = a[4], a11 = a[5], a12 = a[6], a13 = a[7],
+      a20 = a[8], a21 = a[9], a22 = a[10], a23 = a[11], a30 = a[12], a31 = a[13], a32 = a[14], a33 = a[15];
+    const b00 = a00 * a11 - a01 * a10, b01 = a00 * a12 - a02 * a10, b02 = a00 * a13 - a03 * a10, b03 = a01 * a12 - a02 * a11,
+      b04 = a01 * a13 - a03 * a11, b05 = a02 * a13 - a03 * a12, b06 = a20 * a31 - a21 * a30, b07 = a20 * a32 - a22 * a30,
+      b08 = a20 * a33 - a23 * a30, b09 = a21 * a32 - a22 * a31, b10 = a21 * a33 - a23 * a31, b11 = a22 * a33 - a23 * a32;
+    let det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
+    if (!det) return m4.ident();
+    det = 1 / det;
+    o[0] = (a11 * b11 - a12 * b10 + a13 * b09) * det; o[1] = (a02 * b10 - a01 * b11 - a03 * b09) * det;
+    o[2] = (a31 * b05 - a32 * b04 + a33 * b03) * det; o[3] = (a22 * b04 - a21 * b05 - a23 * b03) * det;
+    o[4] = (a12 * b08 - a10 * b11 - a13 * b07) * det; o[5] = (a00 * b11 - a02 * b08 + a03 * b07) * det;
+    o[6] = (a32 * b02 - a30 * b05 - a33 * b01) * det; o[7] = (a20 * b05 - a22 * b02 + a23 * b01) * det;
+    o[8] = (a10 * b10 - a11 * b08 + a13 * b06) * det; o[9] = (a01 * b08 - a00 * b10 - a03 * b06) * det;
+    o[10] = (a30 * b04 - a31 * b02 + a33 * b00) * det; o[11] = (a21 * b02 - a20 * b04 - a23 * b00) * det;
+    o[12] = (a11 * b07 - a10 * b09 - a12 * b06) * det; o[13] = (a00 * b09 - a01 * b07 + a02 * b06) * det;
+    o[14] = (a31 * b01 - a30 * b03 - a32 * b00) * det; o[15] = (a20 * b03 - a21 * b01 + a22 * b00) * det;
+    return o;
+  },
+  // 變換點（含透視除法），回傳 [x,y,z,w]
+  xform(m, p) {
+    const x = m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12], y = m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13],
+      z = m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14], w = m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15];
+    return [x, y, z, w];
+  },
+};
+// 羅盤方位（0=北、90=東）＋仰角 → 單位向量（X 東、Y 上、Z 南）
+const dirFromAzEl = (az, el) => [Math.sin(az) * Math.cos(el), Math.sin(el), -Math.cos(az) * Math.cos(el)];
+// 可重現的亂數（mulberry32）
+function rng(seed) { let a = seed >>> 0; return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+// ═══ §J2 物理模型（JavaScript double 參考實作）════════════════════════
+// 高斯煙流＋地面反射；Briggs (1973) 擴散係數；Briggs 浮升（ISC3 的整理方式）。
+// GPU 熱圖用 WGSL（f32）另寫一份，由 ?selftest=1 的 e 項比對。
+const PHYS = (() => {
+  const G = 9.80665, P0 = 101325;
+  // σy = a·x·(1+b·x)^(-1/2)；σz = c·x·(1+d·x)^e      [a, b, c, d, e]
+  const RURAL = {A:[.22,1e-4,.20,0,0], B:[.16,1e-4,.12,0,0], C:[.11,1e-4,.08,2e-4,-.5], D:[.08,1e-4,.06,1.5e-3,-.5], E:[.06,1e-4,.03,3e-4,-1], F:[.04,1e-4,.016,3e-4,-1]};
+  const URBAN = {A:[.32,4e-4,.24,1e-3,.5], B:[.32,4e-4,.24,1e-3,.5], C:[.22,4e-4,.20,0,0], D:[.16,4e-4,.14,3e-4,-.5], E:[.11,4e-4,.08,1.5e-3,-.5], F:[.11,4e-4,.08,1.5e-3,-.5]};
+  // 風速剖面冪次（ISC3）
+  const P_RURAL = {A:.07, B:.07, C:.10, D:.15, E:.35, F:.55};
+  const P_URBAN = {A:.15, B:.15, C:.20, D:.25, E:.30, F:.30};
+  const DTHETA = {E:0.020, F:0.035};   // 位溫梯度 [K/m]
+  const coef = (cls, urban) => (urban ? URBAN : RURAL)[cls];
+  const sigmaK = (k, x) => ({sy: k[0] * x / Math.sqrt(1 + k[1] * x), sz: k[2] * x * Math.pow(1 + k[3] * x, k[4])});
+  const sigma = (cls, urban, x) => sigmaK(coef(cls, urban), x);
+  // 需求裡的基本式：C(x,y,z) = Q/(2π u σy σz)·exp(−y²/2σy²)·[exp(−(z−H)²/2σz²)+exp(−(z+H)²/2σz²)]
+  function gauss(Q, u, sy, sz, y, z, H) {
+    return Q / (2 * Math.PI * u * sy * sz) * Math.exp(-y * y / (2 * sy * sy))
+      * (Math.exp(-(z - H) * (z - H) / (2 * sz * sz)) + Math.exp(-(z + H) * (z + H) / (2 * sz * sz)));
+  }
+  // Briggs 浮升。回傳：us 煙囪口風速、F 浮力通量、dhF 最終浮升、xf 到達最終浮升的距離、
+  // 過渡段 Δh(x)=min(K·x^e, dhF)、hsE 下洗修正後的煙囪高度
+  function rise(p, hs) {
+    const pw = (p.urban ? P_URBAN : P_RURAL)[p.cls];
+    const Ta = p.Ta + 273.15, Ts = Math.max(p.Ts + 273.15, Ta + 0.01);
+    const us = p.u10 * Math.pow(Math.max(hs, 10) / 10, pw);
+    const d = p.d, vs = p.vs, dT = Ts - Ta;
+    const F = G * vs * d * d / 4 * dT / Ts;
+    const Fm = vs * vs * d * d / 4 * Ta / Ts;
+    const stable = p.cls === 'E' || p.cls === 'F';
+    const s = stable ? G / Ta * DTHETA[p.cls] : 0;
+    let dTc, buoy, dhF;
+    if (!stable) {
+      dTc = F < 55 ? 0.0297 * Ts * Math.cbrt(vs) / Math.pow(d, 2 / 3) : 0.00575 * Ts * Math.pow(vs, 2 / 3) / Math.cbrt(d);
+      buoy = dT >= dTc;
+      dhF = buoy ? (F < 55 ? 21.425 * Math.pow(F, 0.75) / us : 38.71 * Math.pow(F, 0.6) / us) : 3 * d * vs / us;
+    } else {
+      dTc = 0.019582 * Ts * vs * Math.sqrt(s);
+      buoy = dT >= dTc;
+      dhF = buoy ? Math.min(2.6 * Math.cbrt(F / (us * s)), 4 * Math.pow(F, 0.25) * Math.pow(s, -0.375))
+                 : Math.min(1.5 * Math.cbrt(Fm / (us * Math.sqrt(s))), 3 * d * vs / us);
+    }
+    let K, e;
+    if (buoy) { K = 1.6 * Math.cbrt(F) / us; e = 2 / 3; }          // 2/3 次方律
+    else { const bj = 1 / 3 + us / vs; K = Math.cbrt(3 * Fm / (bj * bj * us * us)); e = 1 / 3; }
+    const xf = Math.pow(dhF / K, 1 / e);
+    const hsE = vs < 1.5 * us ? hs + 2 * d * (vs / us - 1.5) : hs;   // 煙囪頂下洗
+    return {us, F, Fm, s, buoy, dTc, dhF, xf, K, e, hsE, pw};
+  }
+  // 建立整個模型：params ＋ 煙囪清單 [{x, z, h}]（世界座標，h＝煙囪高度）
+  function build(p, stacks) {
+    const toward = (p.windFrom + 180) * DEG;
+    const wd = [Math.sin(toward), -Math.cos(toward)];   // 下風方向（x, z）
+    const cd = [-wd[1], wd[0]];                          // 橫風方向（x, z）
+    const src = stacks.map(st => ({x: st.x, z: st.z, h: st.h, ...rise(p, st.h)}));
+    const cx = src.reduce((a, s) => a + s.x, 0) / src.length, cz = src.reduce((a, s) => a + s.z, 0) / src.length;
+    const M = {p, k: coef(p.cls, p.urban), Q: p.Q, wd, cd, src, cx, cz, lid: !!p.lid, zi: p.zi};
+    for (const s of src) s.pen = M.lid && (s.hsE + s.dhF > M.zi);   // 穿透逆溫層（ISC3 慣例）
+    return M;
+  }
+  const dhAt = (s, x) => Math.min(s.K * Math.pow(x, s.e), s.dhF);
+  // 單一煙源在煙流座標 (x 下風, y 橫風, z 離地) 的濃度 [g/m³]
+  function concSrc(M, s, x, y, z) {
+    if (x <= 1e-3) return 0;
+    const sg = sigmaK(M.k, x), dh = dhAt(s, x), bid = dh / 3.5;
+    const sy = Math.hypot(sg.sy, bid), sz = Math.hypot(sg.sz, bid);   // 浮升引起的擴散（BID）
+    const H = s.hsE + dh;
+    const A = M.Q / (2 * Math.PI * s.us * sy * sz) * Math.exp(-y * y / (2 * sy * sy));
+    if (M.lid) {
+      if (s.pen) return 0;
+      if (sz >= 1.6 * M.zi) return M.Q / (Math.sqrt(2 * Math.PI) * sy * s.us * M.zi) * Math.exp(-y * y / (2 * sy * sy));
+      let V = 0;
+      for (let n = -4; n <= 4; n++) {
+        const a = z - H + 2 * n * M.zi, b = z + H + 2 * n * M.zi;
+        V += Math.exp(-a * a / (2 * sz * sz)) + Math.exp(-b * b / (2 * sz * sz));
+      }
+      return A * V;
+    }
+    return A * (Math.exp(-(z - H) * (z - H) / (2 * sz * sz)) + Math.exp(-(z + H) * (z + H) / (2 * sz * sz)));
+  }
+  // 世界座標 (wx, wz)、離地高度 z 的總濃度 [g/m³]
+  function concAt(M, wx, wz, z = 0) {
+    let c = 0;
+    for (const s of M.src) {
+      const rx = wx - s.x, rz = wz - s.z;
+      c += concSrc(M, s, rx * M.wd[0] + rz * M.wd[1], rx * M.cd[0] + rz * M.cd[1], z);
+    }
+    return c;
+  }
+  // 以煙囪群中心為原點、沿下風軸的相對座標
+  const relToWorld = (M, x, y) => [M.cx + x * M.wd[0] + y * M.cd[0], M.cz + x * M.wd[1] + y * M.cd[1]];
+  // 最大落地濃度：先粗格搜尋（x 取對數間距 30 m–60 km），再做座標下降細化
+  function findMax(M) {
+    const g = (x, y) => { const w = relToWorld(M, x, y); return concAt(M, w[0], w[1], 0); };
+    let best = {c: 0, x: 0, y: 0};
+    for (let i = 0; i < 360; i++) {
+      const x = 30 * Math.pow(2000, i / 359);
+      for (let j = -10; j <= 10; j++) { const c = g(x, j * 30); if (c > best.c) best = {c, x, y: j * 30}; }
+    }
+    let sx = best.x * 0.04, sy = 12;
+    for (let it = 0; it < 80 && best.c > 0; it++) {
+      let moved = false;
+      for (const [dx, dy] of [[sx, 0], [-sx, 0], [0, sy], [0, -sy]]) {
+        const c = g(best.x + dx, best.y + dy);
+        if (c > best.c) { best = {c, x: best.x + dx, y: best.y + dy}; moved = true; }
+      }
+      if (!moved) { sx *= 0.5; sy *= 0.5; }
+    }
+    const w = relToWorld(M, best.x, best.y);
+    return {cmax: best.c, xmax: best.x, ymax: best.y, wx: w[0], wz: w[1]};
+  }
+  // 凝結水氣（混合線）：混合比例 f（煙氣質量分率）→ 液態水混合比 [kg/kg]
+  const esat = (Tc) => 610.94 * Math.exp(17.625 * Tc / (Tc + 243.04));     // 飽和水氣壓 [Pa]（Magnus）
+  const wsat = (Tc) => { const e = esat(Tc); return 0.622 * e / (P0 - e); };
+  function condensation(p) {
+    const Ta = p.Ta, Ts = Math.max(p.Ts, Ta);
+    const wa = p.rh / 100 * wsat(Ta);
+    const ws = wsat(Math.min(Ts, 55)) + 0.002;   // 煙氣含水量：濕式脫硫出口約 55 °C 飽和；另含少量液滴夾帶
+    const LvCp = 2.45e6 / 1006;
+    const liq = (f) => {
+      const wt = wa + f * (ws - wa), T0 = Ta + f * (Ts - Ta);
+      if (wt <= wsat(T0)) return 0;
+      let lo = T0, hi = T0 + LvCp * (wt - wsat(T0));     // 凝結放出潛熱使混合氣升溫 → 二分法解平衡溫度
+      for (let i = 0; i < 40; i++) { const T = (lo + hi) / 2; if (T - T0 < LvCp * (wt - wsat(T))) lo = T; else hi = T; }
+      return Math.max(0, wt - wsat((lo + hi) / 2));
+    };
+    const N = 256, lut = new Float32Array(N);
+    for (let i = 0; i < N; i++) lut[i] = liq(Math.pow(2, -12 * (1 - i / (N - 1))));
+    let fcrit = 1;
+    for (let i = 0; i < 4000; i++) { const f = Math.pow(2, -14 * (1 - i / 3999)); if (liq(f) > 0) { fcrit = f; break; } }
+    return {lut, fcrit, wa, ws, liq};
+  }
+  return {G, coef, sigma, sigmaK, gauss, rise, build, dhAt, concSrc, concAt, relToWorld, findMax, condensation, esat, wsat, P_RURAL, P_URBAN};
+})();
+
+// ═══ §J3 GPU 基礎建設 ═════════════════════════════════════════════════
+let adapter = null, device = null, context = null, presentFormat = 'bgra8unorm';
+const canvas = $('#gfx');
+const GPU = {ready: false, gen: 0, bglCache: new Map(), pipelines: {}, adapterName: '', glName: '', features: [], software: false, lostCount: 0};
+const RES = {};   // 依名稱登記的 GPU 資源（bind group 依 WGSL 變數名稱來這裡找）
+const RT = {};    // render targets
+
+function reportError(text) {
+  if (S.errors.length > 40) return;   // 同一個錯誤每幀都會重複，超過就不再記
+  console.error(text);
+  S.errors.push(text);
+  if (S.errors.length > 40) { GPU.ready = false; console.error('[海港夕煙] 錯誤太多，停止渲染。'); }
+  if (CFG.debug) { const d = $('#dbg'); d.hidden = false; d.textContent += text + '\n'; }
+}
+window.addEventListener('error', (e) => reportError('[JS] ' + e.message + ' @' + (e.filename || '').split('/').pop() + ':' + e.lineno));
+window.addEventListener('unhandledrejection', (e) => reportError('[Promise] ' + (e.reason && (e.reason.stack || e.reason.message) || e.reason)));
+
+// WGSL 模組：#include 名稱、#if 旗標 / #else / #endif
+const WGSL_SRC = {};
+document.querySelectorAll('script[type="text/wgsl"]').forEach(s => { WGSL_SRC[s.id] = s.textContent; });
+function wgsl(id, defs = {}, consts = {}) {
+  const seen = new Set();
+  const expand = (name) => {
+    if (seen.has(name)) return '';
+    seen.add(name);
+    const src = WGSL_SRC[name];
+    if (src === undefined) throw new Error('找不到 WGSL 模組：' + name);
+    const out = [], stack = [];
+    for (const line of src.split('\n')) {
+      const t = line.trim();
+      if (t.startsWith('#if ')) { const k = t.slice(4).trim(); stack.push(k.startsWith('!') ? !defs[k.slice(1)] : !!defs[k]); continue; }
+      if (t === '#else') { stack[stack.length - 1] = !stack[stack.length - 1]; continue; }
+      if (t === '#endif') { stack.pop(); continue; }
+      if (stack.includes(false)) continue;
+      if (t.startsWith('#include ')) { out.push(expand(t.slice(9).trim())); continue; }
+      out.push(line);
+    }
+    return out.join('\n');
+  };
+  let pre = '';
+  for (const [k, v] of Object.entries(consts)) pre += `const ${k} = ${v};\n`;
+  return pre + expand(id);
+}
+function mkShader(label, code) {
+  const mod = device.createShaderModule({label, code});
+  mod.getCompilationInfo().then(info => {
+    const lines = code.split('\n');
+    for (const m of info.messages) {
+      const text = `[WGSL ${label}] ${m.type} 第 ${m.lineNum} 行:${m.linePos} ${m.message}\n    ${(lines[m.lineNum - 1] || '').trim()}`;
+      if (m.type === 'error') reportError(text); else console.warn(text);
+    }
+  });
+  return mod;
+}
+// 解析 WGSL 的 @group/@binding 宣告 → bind group layout 項目
+function reflectBindings(code) {
+  const groups = [];
+  const re = /@group\((\d+)\)\s*@binding\((\d+)\)\s*var(?:<([^>]+)>)?\s+(\w+)\s*:\s*([^;]+);[ \t]*(?:\/\/[ \t]*@(\w+))?/g;
+  let m;
+  while ((m = re.exec(code))) {
+    const g = +m[1], access = m[3] || '', type = m[5].trim(), tag = m[6] || '';
+    const e = {binding: +m[2], name: m[4], layout: null, rw: false};
+    let t;
+    if (access.startsWith('uniform')) e.layout = {buffer: {type: 'uniform'}};
+    else if (access.startsWith('storage')) { e.rw = access.includes('read_write'); e.layout = {buffer: {type: e.rw ? 'storage' : 'read-only-storage'}}; }
+    else if (type === 'sampler') e.layout = {sampler: {type: tag === 'nonfiltering' ? 'non-filtering' : 'filtering'}};
+    else if (type === 'sampler_comparison') e.layout = {sampler: {type: 'comparison'}};
+    else if ((t = /^texture_storage_(2d_array|2d|3d)<\s*(\w+)\s*,\s*(\w+)\s*>/.exec(type))) { e.rw = true; e.layout = {storageTexture: {access: 'write-only', format: t[2], viewDimension: t[1].replace('_', '-')}}; }
+    else if (/^texture_depth_multisampled_2d/.test(type)) e.layout = {texture: {sampleType: 'depth', viewDimension: '2d', multisampled: true}};
+    else if ((t = /^texture_depth_(2d_array|2d|cube)/.exec(type))) e.layout = {texture: {sampleType: 'depth', viewDimension: t[1].replace('_', '-')}};
+    else if (/^texture_multisampled_2d/.test(type)) e.layout = {texture: {sampleType: 'unfilterable-float', viewDimension: '2d', multisampled: true}};
+    else if ((t = /^texture_(1d|2d_array|2d|3d|cube)<\s*(f32|u32|i32)\s*>/.exec(type))) {
+      const st = t[2] === 'u32' ? 'uint' : t[2] === 'i32' ? 'sint' : (tag === 'unfilterable' ? 'unfilterable-float' : 'float');
+      e.layout = {texture: {sampleType: st, viewDimension: t[1].replace('_', '-')}};
+    } else throw new Error('無法解析 binding 型別：' + type);
+    (groups[g] ||= []).push(e);
+  }
+  for (let g = 0; g < groups.length; g++) groups[g] = (groups[g] || []).sort((a, b) => a.binding - b.binding);
+  return groups;
+}
+function mkLayouts(code) {
+  const infos = reflectBindings(code), bgls = [];
+  const ALL = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE;
+  for (const ents of infos) {
+    const desc = ents.map(e => ({binding: e.binding, visibility: e.rw ? (GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE) : ALL, ...e.layout}));
+    const key = JSON.stringify(desc);
+    let bgl = GPU.bglCache.get(key);
+    if (!bgl) { bgl = device.createBindGroupLayout({entries: desc}); GPU.bglCache.set(key, bgl); }
+    bgls.push(bgl);
+  }
+  return {infos, bgls, layout: device.createPipelineLayout({bindGroupLayouts: bgls})};
+}
+// render pipeline：o = {label, id, defs, consts, targets, depth, primitive, buffers, samples, vs, fs}
+function mkRender(o) {
+  const code = wgsl(o.id, o.defs, o.consts);
+  const L = mkLayouts(code), mod = mkShader(o.label, code);
+  const desc = {
+    label: o.label, layout: L.layout,
+    vertex: {module: mod, entryPoint: o.vs || 'vs', buffers: o.buffers || []},
+    primitive: o.primitive || {topology: 'triangle-list', cullMode: 'none'},
+    multisample: {count: o.samples || 1},
+  };
+  if (o.targets) desc.fragment = {module: mod, entryPoint: o.fs || 'fs', targets: o.targets};
+  if (o.depth) desc.depthStencil = o.depth;
+  return {label: o.label, pipeline: device.createRenderPipeline(desc), infos: L.infos, bgls: L.bgls, bg: new Map(), code};
+}
+function mkCompute(o) {
+  const code = wgsl(o.id, o.defs, o.consts);
+  const L = mkLayouts(code), mod = mkShader(o.label, code);
+  return {label: o.label, pipeline: device.createComputePipeline({label: o.label, layout: L.layout, compute: {module: mod, entryPoint: o.entry || 'main'}}),
+    infos: L.infos, bgls: L.bgls, bg: new Map(), code};
+}
+// 依變數名稱組 bind group。over＝覆寫資源；同一個 pipeline 用不同資源組合時要給不同的 variant 名稱
+function bindGroup(P, g, over, variant) {
+  const key = g + ':' + (variant || '');
+  const c = P.bg.get(key);
+  if (c && c.gen === GPU.gen) return c.bg;
+  const entries = P.infos[g].map(e => {
+    const r = (over && over[e.name] !== undefined) ? over[e.name] : RES[e.name];
+    if (!r) throw new Error(`缺少資源「${e.name}」（pipeline ${P.label}，group ${g}）`);
+    return {binding: e.binding, resource: (r instanceof GPUBuffer) ? {buffer: r} : r};
+  });
+  const bg = device.createBindGroup({label: P.label + ':' + key, layout: P.bgls[g], entries});
+  P.bg.set(key, {gen: GPU.gen, bg});
+  return bg;
+}
+function usePipeline(pass, P, over, variant) {
+  pass.setPipeline(P.pipeline);
+  for (let g = 0; g < P.infos.length; g++) pass.setBindGroup(g, bindGroup(P, g, over, variant));
+}
+// uniform buffer：解析 WGSL struct（只允許 vec4f / mat4x4f / 這兩者的陣列）自動算位移
+function parseStruct(code, name) {
+  const m = new RegExp('struct\\s+' + name + '\\s*\\{([^}]*)\\}').exec(code);
+  if (!m) throw new Error('找不到 struct ' + name);
+  const fields = {}; let off = 0;
+  for (const line of m[1].split('\n')) {
+    const fm = /^\s*(\w+)\s*:\s*(array<\s*\w+\s*,\s*\d+\s*>|\w+)/.exec(line);
+    if (!fm) continue;
+    let type = fm[2], count = 1;
+    const am = /^array<\s*(\w+)\s*,\s*(\d+)\s*>$/.exec(type);
+    if (am) { type = am[1]; count = +am[2]; }
+    const size = {vec4f: 16, mat4x4f: 64, vec4u: 16, vec4i: 16}[type];
+    if (!size) throw new Error(`uniform struct ${name}.${fm[1]} 用了 ${type}；只允許 vec4f、mat4x4f`);
+    fields[fm[1]] = {off, size, count};
+    off += size * count;
+  }
+  return {fields, size: off};
+}
+class UBO {
+  constructor(label, structName, code) {
+    this.info = parseStruct(code, structName);
+    this.f32 = new Float32Array(this.info.size / 4);
+    this.buf = device.createBuffer({label, size: this.info.size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST});
+  }
+  set(field, arr, idx = 0) {
+    const f = this.info.fields[field];
+    if (!f) throw new Error('uniform 沒有欄位 ' + field);
+    this.f32.set(arr, (f.off + idx * f.size) / 4);
+    return this;
+  }
+  upload() { device.queue.writeBuffer(this.buf, 0, this.f32); }
+}
+function mkTex(label, w, h, format, usage, extra = {}) {
+  const t = device.createTexture({label, size: [w, h, extra.depth || 1], format, usage, sampleCount: extra.samples || 1,
+    dimension: extra.dimension || '2d', mipLevelCount: extra.mips || 1});
+  t.view = t.createView(extra.viewDesc);
+  return t;
+}
+const TU = () => GPUTextureUsage;
+
+// 各 pass 的 GPU 計時（timestamp-query；沒有這個功能就略過）
+const TIMER = {ok: false, active: false, cap: 40, names: [], acc: {}, n: 0};
+function timerInit() {
+  TIMER.ok = device.features.has('timestamp-query');
+  if (!TIMER.ok) return;
+  TIMER.qs = device.createQuerySet({type: 'timestamp', count: TIMER.cap * 2});
+  TIMER.resolveBuf = device.createBuffer({size: TIMER.cap * 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC});
+  TIMER.readBuf = device.createBuffer({size: TIMER.cap * 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST});
+  TIMER.busy = false;
+}
+function tsw(name) {
+  if (!TIMER.ok || !TIMER.active) return undefined;
+  let i = TIMER.names.indexOf(name);
+  if (i < 0) { if (TIMER.names.length >= TIMER.cap) return undefined; i = TIMER.names.length; TIMER.names.push(name); }
+  TIMER.used.add(i);
+  return {querySet: TIMER.qs, beginningOfPassWriteIndex: i * 2, endOfPassWriteIndex: i * 2 + 1};
+}
+function timerResolve(enc) {
+  if (!TIMER.ok || !TIMER.active || TIMER.busy || !TIMER.names.length) return null;
+  const n = TIMER.names.length, used = [...TIMER.used];
+  enc.resolveQuerySet(TIMER.qs, 0, n * 2, TIMER.resolveBuf, 0);
+  enc.copyBufferToBuffer(TIMER.resolveBuf, 0, TIMER.readBuf, 0, n * 16);
+  TIMER.busy = true;
+  return () => TIMER.readBuf.mapAsync(GPUMapMode.READ, 0, n * 16).then(() => {
+    const a = new BigInt64Array(TIMER.readBuf.getMappedRange(0, n * 16));
+    for (const i of used) { const ms = Number(a[i * 2 + 1] - a[i * 2]) / 1e6; if (ms >= 0 && ms < 1000) TIMER.acc[TIMER.names[i]] = (TIMER.acc[TIMER.names[i]] || 0) + ms; }
+    TIMER.n++;
+    TIMER.readBuf.unmap(); TIMER.busy = false;
+  }).catch(() => { TIMER.busy = false; });
+}
+// 開 render pass／compute pass 的統一入口（順便掛計時）
+function RP(enc, name, desc) { const t = tsw(name); if (t) desc.timestampWrites = t; desc.label = name; return enc.beginRenderPass(desc); }
+function CP(enc, name) { const t = tsw(name); const d = {label: name}; if (t) d.timestampWrites = t; return enc.beginComputePass(d); }
+
+function fail(msg, detail) {
+  $('#fallback').hidden = false;
+  if (msg) $('#fallbackMsg').innerHTML = msg;
+  $('#fallbackDetail').textContent = detail || '';
+  console.error('[啟動失敗] ' + (detail || msg));
+}
+
+async function initGPU() {
+  if (!navigator.gpu) { fail(null, 'navigator.gpu 不存在'); return false; }
+  adapter = await navigator.gpu.requestAdapter({powerPreference: 'high-performance'});
+  if (!adapter) { fail('找不到可用的 WebGPU 顯示卡（adapter）。<br>請確認瀏覽器是最新版的 Chrome 或 Edge（或 Safari 26 以上），並且沒有停用硬體加速。', 'requestAdapter() 回傳 null'); return false; }
+  const info = adapter.info || {};
+  GPU.adapterName = [info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(' ') || '(未提供)';
+  try {
+    const gl = document.createElement('canvas').getContext('webgl');
+    const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+    GPU.glName = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : '';
+    const lose = gl && gl.getExtension('WEBGL_lose_context'); if (lose) lose.loseContext();
+  } catch (e) { GPU.glName = ''; }
+  GPU.software = !!(info.isFallbackAdapter || adapter.isFallbackAdapter) || /swiftshader|llvmpipe|software|basic render|warp/i.test(GPU.adapterName + ' ' + GPU.glName);
+  GPU.features = ['timestamp-query', 'float32-filterable', 'shader-f16'].filter(f => adapter.features.has(f));
+  device = await adapter.requestDevice({requiredFeatures: GPU.features});   // 只用預設 limits
+  device.onuncapturederror = (e) => reportError('[WebGPU] ' + (e.error && e.error.message || e.error));
+  const dev = device;
+  device.lost.then((info) => {
+    if (dev !== device) return;
+    GPU.ready = false;
+    console.warn('[WebGPU] device lost：' + info.reason + ' ' + info.message);
+    if (info.reason !== 'destroyed' && GPU.lostCount < 5) { GPU.lostCount++; setTimeout(() => start(true), 600); }
+  });
+  context = canvas.getContext('webgpu');
+  presentFormat = navigator.gpu.getPreferredCanvasFormat();
+  context.configure({device, format: presentFormat, alphaMode: 'opaque'});
+  return true;
+}
+
+// ═══ §J4 render target 與共用資源 ═════════════════════════════════════
+function pickTier() {
+  if (CFG.q && TIERS[CFG.q]) return TIERS[CFG.q];
+  if (CFG.shot) return TIERS.high;
+  const ua = navigator.userAgent, name = (GPU.adapterName + ' ' + GPU.glName).toLowerCase();
+  const mobile = /Android|iPhone|iPad|Mobile/i.test(ua) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(ua));
+  if (GPU.software) return TIERS.low;
+  if (mobile) return /apple|adreno \(tm\) 7|adreno \(tm\) 8|mali-g7[1-9]\d|immortalis/i.test(name) ? TIERS.medium : TIERS.low;
+  if (/nvidia|amd|radeon|geforce|apple/.test(name) && !/intel/.test(name)) return TIERS.high;
+  return TIERS.medium;
+}
+function resizeCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const max = device ? device.limits.maxTextureDimension2D : 8192;
+  const w = clamp(Math.round(canvas.clientWidth * dpr), 8, max), h = clamp(Math.round(canvas.clientHeight * dpr), 8, max);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+}
+function allocTargets() {
+  resizeCanvas();
+  const scale = clamp(S.renderScale, TIER.minScale, 1) * TIER.maxScale;
+  const w = Math.max(8, Math.round(canvas.width * scale)), h = Math.max(8, Math.round(canvas.height * scale));
+  if (RT.w === w && RT.h === h && RT.msaa === TIER.msaa) return false;
+  for (const k of ['hdr', 'msColor', 'depth']) if (RT[k]) { RT[k].destroy(); RT[k] = null; }
+  RT.w = w; RT.h = h; RT.msaa = TIER.msaa;
+  const U = GPUTextureUsage;
+  RT.hdr = mkTex('hdr', w, h, 'rgba16float', U.RENDER_ATTACHMENT | U.TEXTURE_BINDING);
+  if (TIER.msaa > 1) RT.msColor = mkTex('msColor', w, h, 'rgba16float', U.RENDER_ATTACHMENT | U.TEXTURE_BINDING, {samples: TIER.msaa});
+  RT.depth = mkTex('depth', w, h, 'depth32float', U.RENDER_ATTACHMENT | U.TEXTURE_BINDING, {samples: TIER.msaa});
+  RES.hdrTex = RT.hdr.view;
+  RES.msTex = RT.msColor ? RT.msColor.view : null;
+  GPU.gen++;
+  return true;
+}
+// 大氣參數（單位公里；係數取自 Hillaire 2020／Bruneton 2008，另加一層近地霾）
+const ATMO = {
+  rayleigh: [5.802e-3, 13.558e-3, 33.1e-3], hR: 8,
+  mieS: 3.996e-3, mieA: 4.40e-3, hM: 1.2, g: 0.8,
+  ozone: [0.650e-3, 1.881e-3, 0.085e-3],
+  hazeS: 0.030, hazeA: 0.003, hH: 0.7,
+  E0: 20, sunRad: 0.00465, albedo: 0.12, cloud: 0.55, sunClamp: 9000, dirty: true,
+};
+const RGk = 6360, RTk = 6460;
+function atmoExt(h) {
+  const dR = Math.exp(-h / ATMO.hR), dM = Math.exp(-h / ATMO.hM), dH = Math.exp(-h / ATMO.hH), dO = Math.max(0, 1 - Math.abs(h - 25) / 15);
+  const m = (ATMO.mieS + ATMO.mieA) * dM + (ATMO.hazeS + ATMO.hazeA) * dH;
+  return [0, 1, 2].map(i => ATMO.rayleigh[i] * dR + m + ATMO.ozone[i] * dO);
+}
+// CPU 版透射率（和 lut_trans 同一個積分）：高度 hKm 的點沿天頂角餘弦 mu 到大氣頂；被地球擋住時為 0
+function transCPU(hKm, mu) {
+  const r = RGk + hKm, hc = -Math.sqrt(Math.max(1 - (RGk / r) ** 2, 0));
+  const vis = smooth(-0.004, 0.004, mu - hc);
+  if (vis <= 0) return [0, 0, 0];
+  const tTop = -r * mu + Math.sqrt(Math.max(r * r * (mu * mu - 1) + RTk * RTk, 0)), N = 96, od = [0, 0, 0];
+  for (let i = 0; i < N; i++) {
+    const t0 = (i / N) ** 2 * tTop, t1 = ((i + 1) / N) ** 2 * tTop, t = 0.5 * (t0 + t1);
+    const e = atmoExt(Math.max(Math.sqrt(r * r + t * t + 2 * r * t * mu) - RGk, 0));
+    for (let c = 0; c < 3; c++) od[c] += e[c] * (t1 - t0);
+  }
+  return od.map(o => Math.exp(-o) * vis);
+}
+// 曝光：依太陽高度（度）內插 EV；數值是看截圖調出來的
+const EXPO_TABLE = [[25, -1.3], [10, -0.8], [3.6, 0.0], [0, 0.8], [-3, 2.3], [-6, 4.4], [-9, 6.0], [-12, 6.8], [-18, 7.2]];
+function exposureFor(elDeg) {
+  const T = EXPO_TABLE;
+  if (elDeg >= T[0][0]) return 2 ** T[0][1];
+  for (let i = 1; i < T.length; i++) if (elDeg >= T[i][0]) { const k = (elDeg - T[i][0]) / (T[i - 1][0] - T[i][0]); return 2 ** lerp(T[i][1], T[i - 1][1], k); }
+  return 2 ** T[T.length - 1][1];
+}
+// 可平鋪的 2D 雜訊貼圖：R、G＝兩組 Perlin FBM，B＝1−Worley，A＝白雜訊。CPU 產生一次後保留，device lost 時重傳
+let NOISE2D = null;
+function genNoise2D(size = 512) {
+  const R = rng(20261115);
+  const mkPerlin = (period, seed) => {
+    const r = rng(seed), g = new Float32Array(period * period * 2);
+    for (let i = 0; i < period * period; i++) { const a = r() * Math.PI * 2; g[i * 2] = Math.cos(a); g[i * 2 + 1] = Math.sin(a); }
+    const gr = (ix, iy, dx, dy) => { const k = (((iy % period) + period) % period * period + ((ix % period) + period) % period) * 2; return g[k] * dx + g[k + 1] * dy; };
+    return (x, y) => {
+      const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi;
+      const u = fx * fx * fx * (fx * (fx * 6 - 15) + 10), v = fy * fy * fy * (fy * (fy * 6 - 15) + 10);
+      return lerp(lerp(gr(xi, yi, fx, fy), gr(xi + 1, yi, fx - 1, fy), u), lerp(gr(xi, yi + 1, fx, fy - 1), gr(xi + 1, yi + 1, fx - 1, fy - 1), u), v);
+    };
+  };
+  const fbm = (base, seed, oct) => {
+    const L = []; for (let o = 0; o < oct; o++) L.push(mkPerlin(base << o, seed + o * 17));
+    return (u, v) => { let s = 0, amp = 0.5, n = 0; for (let o = 0; o < oct; o++) { s += amp * L[o](u * (base << o), v * (base << o)); n += amp; amp *= 0.5; } return s / n; };
+  };
+  const f1 = fbm(4, 11, 6), f2 = fbm(6, 77, 6);
+  const cells = 16, pts = new Float32Array(cells * cells * 2).map(() => R());
+  const worley = (u, v) => {
+    const x = u * cells, y = v * cells, xi = Math.floor(x), yi = Math.floor(y); let md = 9;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const cx = ((xi + dx) % cells + cells) % cells, cy = ((yi + dy) % cells + cells) % cells;
+      md = Math.min(md, Math.hypot(x - (xi + dx + pts[(cy * cells + cx) * 2]), y - (yi + dy + pts[(cy * cells + cx) * 2 + 1])));
+    }
+    return md;
+  };
+  const mips = []; let data = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const u = (x + 0.5) / size, v = (y + 0.5) / size, i = (y * size + x) * 4;
+    data[i] = clamp(0.5 + f1(u, v) * 1.35, 0, 1) * 255;
+    data[i + 1] = clamp(0.5 + f2(u, v) * 1.35, 0, 1) * 255;
+    data[i + 2] = clamp(1 - worley(u, v), 0, 1) * 255;
+    data[i + 3] = R() * 255;
+  }
+  mips.push(data);
+  for (let s = size >> 1; s >= 1; s >>= 1) {   // box filter 產生 mip
+    const prev = mips[mips.length - 1], ps = s * 2, d = new Uint8Array(s * s * 4);
+    for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) for (let c = 0; c < 4; c++)
+      d[(y * s + x) * 4 + c] = (prev[((y * 2) * ps + x * 2) * 4 + c] + prev[((y * 2) * ps + x * 2 + 1) * 4 + c] + prev[((y * 2 + 1) * ps + x * 2) * 4 + c] + prev[((y * 2 + 1) * ps + x * 2 + 1) * 4 + c]) >> 2;
+    mips.push(d);
+  }
+  return {size, mips};
+}
+const LUT = {};
+let UFrame = null, UPost = null, UAtmo = null;
+function buildAtmoResources() {
+  const U = GPUTextureUsage, RU = U.RENDER_ATTACHMENT | U.TEXTURE_BINDING;
+  LUT.trans = mkTex('transLUT', 256, 64, 'rgba16float', RU);
+  LUT.ms = mkTex('msLUT', 32, 32, 'rgba16float', RU);
+  LUT.sky = mkTex('skyLUT', 192, 108, 'rgba16float', RU);
+  LUT.amb = mkTex('ambCube', 6, 1, 'rgba16float', RU);
+  RES.transLUT = LUT.trans.view; RES.msLUT = LUT.ms.view; RES.skyLUT = LUT.sky.view; RES.ambCube = LUT.amb.view;
+  if (!NOISE2D) NOISE2D = genNoise2D(512);
+  const n = device.createTexture({label: 'noise2D', size: [NOISE2D.size, NOISE2D.size], format: 'rgba8unorm', mipLevelCount: NOISE2D.mips.length, usage: U.TEXTURE_BINDING | U.COPY_DST});
+  NOISE2D.mips.forEach((d, i) => { const s = NOISE2D.size >> i; device.queue.writeTexture({texture: n, mipLevel: i}, d, {bytesPerRow: s * 4}, [s, s]); });
+  RES.noise2D = n.createView();
+  UAtmo = new UBO('Atmo', 'Atmo', WGSL_SRC.common);
+  RES.A = UAtmo.buf;
+  ATMO.dirty = true;
+}
+function uploadAtmo() {
+  UAtmo.set('rayleigh', [...ATMO.rayleigh, ATMO.hR]).set('mie', [ATMO.mieS, ATMO.mieA, ATMO.hM, ATMO.g])
+    .set('ozone', [...ATMO.ozone, 0]).set('haze', [ATMO.hazeS, ATMO.hH, 0, ATMO.hazeA])
+    .set('sunE', [ATMO.E0, ATMO.E0, ATMO.E0, ATMO.sunRad])
+    .set('misc', [ATMO.albedo, clamp(S.cam.pos[1], 1, 60000) * 0.001, ATMO.cloud, ATMO.sunClamp]);
+  UAtmo.upload();
+}
+function buildStatic() {
+  // 取樣器與共用 uniform
+  RES.sLin = device.createSampler({magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge'});
+  RES.sRep = device.createSampler({magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'repeat'});
+  RES.sNear = device.createSampler({magFilter: 'nearest', minFilter: 'nearest'});
+  UFrame = new UBO('Frame', 'Frame', WGSL_SRC.common);
+  RES.F = UFrame.buf;
+  UPost = new UBO('PostU', 'PostU', WGSL_SRC.post_final);
+  RES.P = UPost.buf;
+  const black = mkTex('black', 1, 1, 'rgba16float', GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST);
+  device.queue.writeTexture({texture: black}, new Uint16Array(4), {}, [1, 1]);
+  RES.black = black.view;
+  RES.bloomTex = black.view;
+  buildAtmoResources();
+}
+function buildPipelines() {
+  const P = GPU.pipelines = {};
+  const depthMain = {format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater-equal'};
+  const HDR = [{format: 'rgba16float'}];
+  P.lutTrans = mkRender({label: 'lutTrans', id: 'lut_trans', targets: HDR});
+  P.lutMs = mkRender({label: 'lutMs', id: 'lut_ms', targets: HDR});
+  P.lutSky = mkRender({label: 'lutSky', id: 'lut_sky', targets: HDR});
+  P.amb = mkRender({label: 'amb', id: 'amb_cube', targets: HDR});
+  P.sky = mkRender({label: 'sky', id: 'sky', targets: HDR, samples: TIER.msaa,
+    depth: {format: 'depth32float', depthWriteEnabled: false, depthCompare: 'greater-equal'}});
+  if (TIER.msaa > 1) P.resolve = mkRender({label: 'resolve', id: 'resolve', targets: [{format: 'rgba16float'}]});
+  P.final = mkRender({label: 'final', id: 'post_final', targets: [{format: presentFormat}]});
+}
+
+// ═══ §J6 各個 pass ════════════════════════════════════════════════════
+const SUN = {dir: [0, 1, 0], az: 0, el: 0, illum: [1, 1, 1], night: 0};
+function updateSun() {
+  // 太陽：日落時（timeMin=0）高度 0°；每分鐘下降約 0.225°，方位每分鐘往北約 0.1°（高雄 9 月中旬的近似）
+  SUN.el = -S.timeMin * 0.225 * DEG;
+  SUN.az = (272 + (S.timeMin + 16) * 0.1) * DEG;
+  SUN.dir = dirFromAzEl(SUN.az, SUN.el);
+  const elDeg = SUN.el / DEG;
+  SUN.illum = transCPU(0.05, Math.sin(SUN.el)).map(t => t * ATMO.E0);   // 地面附近的太陽照度（含大氣消光）
+  SUN.night = smooth(2.0, -7.0, elDeg);                                 // 夜間係數：燈光依這個值逐漸亮起
+  S.exposure = exposureFor(elDeg) * (S.evBias ? 2 ** S.evBias : 1);
+}
+const CAM = {view: null, proj: null, viewProj: m4.ident(), prevViewProj: m4.ident(), right: [1, 0, 0], up: [0, 1, 0], fwd: [0, 0, -1], near: 0.5};
+function updateFrameUniforms() {
+  const c = S.cam, aspect = RT.w / RT.h;
+  CAM.fwd = dirFromAzEl(c.yaw, c.pitch);
+  CAM.right = v3.norm(v3.cross(CAM.fwd, [0, 1, 0]));
+  CAM.up = v3.cross(CAM.right, CAM.fwd);
+  CAM.view = m4.viewBasis(c.pos, CAM.right, CAM.up, CAM.fwd);
+  CAM.proj = m4.perspRevInf(c.fov, aspect, CAM.near);
+  CAM.prevViewProj = CAM.viewProj;
+  CAM.viewProj = m4.mul(CAM.proj, CAM.view);
+  const th = Math.tan(c.fov / 2);
+  UFrame.set('viewProj', CAM.viewProj).set('prevViewProj', CAM.prevViewProj)
+    .set('camPos', [...c.pos, CAM.near]).set('camRight', [...CAM.right, th * aspect]).set('camUp', [...CAM.up, th])
+    .set('camFwd', [...CAM.fwd, S.exposure]).set('viewport', [RT.w, RT.h, 1 / RT.w, 1 / RT.h])
+    .set('sunDir', [...SUN.dir, SUN.el]).set('sunIllum', [...SUN.illum, SUN.night])
+    .set('time', [S.simTime, S.frame, S.modeK, 0]);
+  UFrame.upload();
+  UPost.set('p0', [S.exposure, 0.0, S.modeK * 0.7, 0.35]).set('p1', [canvas.width, canvas.height, S.frame % 1024, 0]);
+  UPost.upload();
+  uploadAtmo();
+}
+function fsPass(enc, name, P, view) {
+  const pass = RP(enc, name, {colorAttachments: [{view, loadOp: 'clear', storeOp: 'store'}]});
+  usePipeline(pass, P); pass.draw(3); pass.end();
+}
+function render() {
+  allocTargets();
+  updateSun();
+  updateFrameUniforms();
+  const P = GPU.pipelines;
+  const enc = device.createCommandEncoder();
+  TIMER.used = new Set();
+  // 大氣查表
+  if (ATMO.dirty) { fsPass(enc, 'lutTrans', P.lutTrans, LUT.trans.view); fsPass(enc, 'lutMs', P.lutMs, LUT.ms.view); ATMO.dirty = false; }
+  fsPass(enc, 'lutSky', P.lutSky, LUT.sky.view);
+  fsPass(enc, 'amb', P.amb, LUT.amb.view);
+  // 主場景
+  {
+    const pass = RP(enc, 'main', {
+      colorAttachments: [{view: (RT.msColor || RT.hdr).view, clearValue: [0, 0, 0, 1], loadOp: 'clear', storeOp: 'store'}],
+      depthStencilAttachment: {view: RT.depth.view, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'store'},
+    });
+    usePipeline(pass, P.sky); pass.draw(3);
+    pass.end();
+  }
+  if (RT.msColor) {
+    const pass = RP(enc, 'resolve', {colorAttachments: [{view: RT.hdr.view, loadOp: 'clear', storeOp: 'store'}]});
+    usePipeline(pass, P.resolve); pass.draw(3); pass.end();
+  }
+  {
+    const pass = RP(enc, 'final', {colorAttachments: [{view: context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store'}]});
+    usePipeline(pass, P.final); pass.draw(3); pass.end();
+  }
+  const after = timerResolve(enc);
+  device.queue.submit([enc.finish()]);
+  if (after) after();
+  S.frame++;
+}
+
+// ═══ §J7 相機與輸入 ═══════════════════════════════════════════════════
+const KEYS = new Set();
+const INPUT = {locked: false, dragging: false, lx: 0, ly: 0, joy: [0, 0], lift: 0};
+function userActed() {
+  if (S.userActed) return;
+  S.userActed = true;
+  S.cam.fovTarget = 45 * DEG;
+}
+function lookBy(dx, dy) {
+  const k = 0.0022 * (S.cam.fov / (45 * DEG));
+  S.cam.yaw = (S.cam.yaw + dx * k + Math.PI * 2) % (Math.PI * 2);
+  S.cam.pitch = clamp(S.cam.pitch - dy * k, -89 * DEG, 89 * DEG);
+}
+function initInput() {
+  const typing = (e) => /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(e.target.tagName) && e.target !== canvas;
+  window.addEventListener('keydown', (e) => {
+    if (typing(e)) return;   // 焦點在介面控制項上時，按鍵留給控制項
+    if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'ShiftLeft', 'ShiftRight', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
+      KEYS.add(e.code); userActed();
+      if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+    }
+  });
+  window.addEventListener('keyup', (e) => KEYS.delete(e.code));
+  window.addEventListener('blur', () => KEYS.clear());
+  canvas.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    canvas.focus();
+    INPUT.dragging = true; INPUT.lx = e.clientX; INPUT.ly = e.clientY;
+    if (!INPUT.locked && canvas.requestPointerLock && !CFG.shot) { try { const r = canvas.requestPointerLock(); if (r && r.catch) r.catch(() => {}); } catch (err) {} }
+  });
+  window.addEventListener('mouseup', () => { INPUT.dragging = false; });
+  window.addEventListener('mousemove', (e) => {
+    if (INPUT.locked) { lookBy(e.movementX, e.movementY); userActed(); }
+    else if (INPUT.dragging) { lookBy(e.clientX - INPUT.lx, e.clientY - INPUT.ly); INPUT.lx = e.clientX; INPUT.ly = e.clientY; userActed(); }
+  });
+  document.addEventListener('pointerlockchange', () => { INPUT.locked = document.pointerLockElement === canvas; });
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    S.cam.speed = clamp(S.cam.speed * Math.pow(1.15, -Math.sign(e.deltaY)), 2, 2000);
+    userActed();
+  }, {passive: false});
+}
+function updateCamera(dt) {
+  const c = S.cam;
+  if (!S.userActed && !CFG.shot && !CFG.bench) {
+    // 使用者還沒操作：鏡頭緩慢推移
+    const f = dirFromAzEl(c.yaw, 0), r = [Math.cos(c.yaw), 0, Math.sin(c.yaw)];
+    c.pos = v3.add(c.pos, v3.add(v3.scale(f, 3.0 * dt), v3.scale(r, 1.2 * dt)));
+    return;
+  }
+  let mx = 0, mz = 0, my = 0;
+  if (KEYS.has('KeyW') || KEYS.has('ArrowUp')) mz += 1;
+  if (KEYS.has('KeyS') || KEYS.has('ArrowDown')) mz -= 1;
+  if (KEYS.has('KeyD') || KEYS.has('ArrowRight')) mx += 1;
+  if (KEYS.has('KeyA') || KEYS.has('ArrowLeft')) mx -= 1;
+  if (KEYS.has('Space')) my += 1;
+  if (KEYS.has('ShiftLeft') || KEYS.has('ShiftRight')) my -= 1;
+  mx += INPUT.joy[0]; mz += INPUT.joy[1]; my += INPUT.lift;
+  const f = dirFromAzEl(c.yaw, c.pitch), r = [Math.cos(c.yaw), 0, Math.sin(c.yaw)];
+  const want = v3.scale([f[0] * mz + r[0] * mx, f[1] * mz + my, f[2] * mz + r[2] * mx], c.speed);
+  const k = 1 - Math.exp(-dt * 8);
+  c.vel = v3.lerp(c.vel, want, k);
+  c.pos = v3.add(c.pos, v3.scale(c.vel, dt));
+  c.pos[0] = clamp(c.pos[0], -14000, 14000); c.pos[2] = clamp(c.pos[2], -14000, 14000); c.pos[1] = clamp(c.pos[1], 1.5, 6000);
+  c.fov = lerp(c.fov, c.fovTarget, 1 - Math.exp(-dt * 2.2));
+}
+
+// ═══ §J9 測試鉤子 ═════════════════════════════════════════════════════
+function selftestCPU() {
+  const out = [];
+  const chk = (id, name, val, ref, tol) => {
+    const err = Math.abs(val - ref) / Math.abs(ref), ok = err < tol;
+    out.push({id, name, val, ref, err, ok});
+    console.log(`SELFTEST ${ok ? 'PASS' : 'FAIL'} ${id} ${name}：計算值=${val.toPrecision(8)}，參考值=${ref}，相對誤差=${(err * 100).toExponential(3)}%（門檻 ${tol * 100}%）`);
+  };
+  const s = PHYS.sigma('D', false, 1000);
+  chk('a1', 'σy（D 級、鄉村、x=1000 m）[m]', s.sy, 76.28, 0.005);
+  chk('a2', 'σz（D 級、鄉村、x=1000 m）[m]', s.sz, 37.95, 0.005);
+  const c1 = PHYS.gauss(100, 5, s.sy, s.sz, 0, 0, 100);
+  chk('b', '地面中心線濃度（Q=100 g/s、u=5 m/s、H=100 m）[μg/m³]', c1 * 1e6, 68.29, 0.005);
+  // c 質量守恆：∫∫ u·C dy dz，y 取 ±8σy，z 取 0 到 H+8σz，中點法
+  let flux = 0; const ny = 400, nz = 800, y0 = -8 * s.sy, dy = 16 * s.sy / ny, zTop = 100 + 8 * s.sz, dz = zTop / nz;
+  for (let j = 0; j < nz; j++) { const z = (j + 0.5) * dz; for (let i = 0; i < ny; i++) flux += 5 * PHYS.gauss(100, 5, s.sy, s.sz, y0 + (i + 0.5) * dy, z, 100) * dy * dz; }
+  chk('c', '質量守恆 ∫∫u·C dy dz（應等於 Q=100）[g/s]', flux, 100, 0.01);
+  const c2 = PHYS.gauss(100, 10, s.sy, s.sz, 0, 0, 100);
+  chk('d', '風速加倍後的濃度比（應為 0.5）', c2 / c1, 0.5, 1e-9);
+  return out;
+}
+async function runSelftest() {
+  const res = selftestCPU();
+  window.__selftest = {items: res, done: false};
+  // e 項（GPU 熱圖回讀）在熱圖 pass 建好後補上
+  if (typeof selftestGPU === 'function') { try { res.push(...await selftestGPU()); } catch (e) { reportError('[selftest e] ' + (e.stack || e)); res.push({id: 'e', ok: false, name: 'GPU 熱圖回讀', err: NaN}); } }
+  const allOk = res.every(r => r.ok);
+  window.__selftest.done = true; window.__selftest.ok = allOk;
+  console.log(`SELFTEST ${allOk ? 'PASS' : 'FAIL'} 總結：${res.filter(r => r.ok).length}/${res.length} 項通過`);
+}
+window.__scene = {
+  setCamera(o) {
+    const c = S.cam;
+    if (o.pos) c.pos = [...o.pos];
+    if (o.target) { const d = v3.norm(v3.sub(o.target, c.pos)); c.yaw = (Math.atan2(d[0], -d[2]) + Math.PI * 2) % (Math.PI * 2); c.pitch = Math.asin(clamp(d[1], -1, 1)); }
+    if (o.yawDeg !== undefined) c.yaw = o.yawDeg * DEG;
+    if (o.pitchDeg !== undefined) c.pitch = o.pitchDeg * DEG;
+    if (o.fovDeg !== undefined) { c.fov = c.fovTarget = o.fovDeg * DEG; }
+    S.userActed = true; c.vel = [0, 0, 0];
+  },
+  setTime(min) { S.timeMin = clamp(+min, -90, 75); },
+  setParams(o) { Object.assign(S.params, o); S.paramsDirty = true; },
+  setMode(m) { S.mode = (m === 1 || m === 'analysis') ? 1 : 0; },
+  getState() { return JSON.parse(JSON.stringify({cam: S.cam, timeMin: S.timeMin, params: S.params, mode: S.mode, tier: TIER.name, res: [RT.w, RT.h], canvas: [canvas.width, canvas.height], adapter: GPU.adapterName, gl: GPU.glName, software: GPU.software, features: GPU.features, frame: S.frame, errors: S.errors.length})); },
+};
+
+// ═══ §J10 主迴圈與啟動 ════════════════════════════════════════════════
+function update(dt) {
+  if (!S.frozen) S.simTime += dt;
+  S.modeK = lerp(S.modeK, S.mode, 1 - Math.exp(-dt * 3.5));
+  if (Math.abs(S.modeK - S.mode) < 0.002) S.modeK = S.mode;
+  updateCamera(dt);
+}
+const LOOP = {lastRaf: 0, lastTick: 0, starved: false, gpuBusy: false, manual: false};
+function tick(nowMs) {
+  if (!GPU.ready || LOOP.gpuBusy || LOOP.manual) return;
+  const now = nowMs * 0.001;
+  let dt = Math.min(now - S.lastT, 0.1);
+  if (S.resetDt || !(dt > 0)) { dt = 1 / 60; S.resetDt = false; }
+  S.lastT = now; LOOP.lastTick = nowMs;
+  try {
+    update(dt); render();
+    LOOP.gpuBusy = true;   // GPU 還沒做完上一幀就不再送，避免工作堆積
+    device.queue.onSubmittedWorkDone().then(() => { LOOP.gpuBusy = false; }, () => { LOOP.gpuBusy = false; });
+  } catch (e) { reportError('[frame] ' + (e.stack || e)); GPU.ready = false; }
+  if (CFG.shot && !window.__shotReady && S.frame >= 90 && !S.errors.length) { window.__shotReady = true; console.log('SHOT_READY'); }
+}
+function rafLoop() {
+  const n = performance.now();
+  if (n - LOOP.lastRaf < 200) LOOP.starved = false;
+  LOOP.lastRaf = n;
+  tick(n);
+  requestAnimationFrame(rafLoop);
+}
+// 視窗被遮住或最小化、但分頁仍算「可見」時，requestAnimationFrame 會被瀏覽器降到每秒 1–2 次（自動化測試常見）。
+// 這時改用計時器推動畫面；真的切到背景分頁（document.hidden）就不畫。
+setInterval(() => {
+  const n = performance.now();
+  if (document.hidden) return;
+  if (n - LOOP.lastRaf > 400) LOOP.starved = true;
+  if (LOOP.starved && n - LOOP.lastTick > 15) tick(n);
+}, 8);
+document.addEventListener('visibilitychange', () => { S.resetDt = true; });   // 分頁切回來時不用累積的時間差
+async function start(isRestart) {
+  try {
+    if (!(await initGPU())) return;
+    for (const k of Object.keys(RT)) delete RT[k];
+    for (const k of Object.keys(RES)) delete RES[k];
+    GPU.bglCache.clear(); GPU.gen++;
+    TIER = pickTier();
+    timerInit();
+    buildStatic();
+    buildPipelines();
+    allocTargets();
+    GPU.ready = true; S.resetDt = true;
+    console.log(`[海港夕煙] adapter=${GPU.adapterName} | ${GPU.glName} | 軟體渲染=${GPU.software} | 畫質=${TIER.name} | features=${GPU.features.join(',')}`);
+    if (!isRestart) {
+      initInput();
+      if (CFG.shot) { S.frozen = true; S.simTime = 40; S.userActed = true; }
+      if (CFG.selftest) runSelftest();
+      requestAnimationFrame(rafLoop);
+    }
+  } catch (e) {
+    reportError('[start] ' + (e.stack || e));
+    fail('啟動時發生錯誤，畫面無法顯示。<br>請改用最新版的 Chrome 或 Edge，或 Safari 26 以上的版本。', String(e && e.message || e));
+  }
+}
+new ResizeObserver(() => { S.resizePending = true; }).observe(canvas);
+start(false);
+</script>
+</body>
+</html>
