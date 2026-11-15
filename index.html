@@ -89,6 +89,11 @@ struct Frame {
   sunDir: vec4f,     // xyz 指向太陽，w = 太陽高度角（rad）
   sunIllum: vec4f,   // rgb 地面的太陽照度，w = 夜間係數 0..1
   time: vec4f,       // x 模擬時間（s），y 幀序號，z 分析模式係數 0..1，w 預留
+  shadowVP: array<mat4x4f, 4>,   // 各 cascade 的光空間矩陣
+  shadowSplit: vec4f,            // 各 cascade 的最遠視距（m）
+  shadowTexel: vec4f,            // 各 cascade 一個 texel 的世界大小（m）
+  shadowPrm: vec4f,              // x cascade 數，y 解析度，z 濾波半徑（texel），w 預留
+  shadowDir: vec4f,              // 陰影用的光方向（高度角有下限）
 };
 // 大氣參數（長度單位：公里）
 struct Atmo {
@@ -104,9 +109,11 @@ struct Atmo {
 @group(0) @binding(2) var sRep: sampler;
 @group(0) @binding(3) var sNear: sampler; // @nonfiltering
 @group(0) @binding(4) var<uniform> A: Atmo;
+@group(0) @binding(5) var sShadow: sampler_comparison;
 
 const PI: f32 = 3.14159265358979;
 const TAU: f32 = 6.28318530717959;
+const MAP_HALF: f32 = 12000.0;   // 地形圖涵蓋 ±12 km（要和 JS 的 WORLD.half 一致）
 
 fn saturate(x: f32) -> f32 { return clamp(x, 0.0, 1.0); }
 fn sat3(x: vec3f) -> vec3f { return clamp(x, vec3f(0.0), vec3f(1.0)); }
@@ -420,6 +427,10 @@ fn skyUv(dir: vec3f) -> vec2f {
 @group(1) @binding(2) var skyLUT: texture_2d<f32>;
 @group(1) @binding(3) var ambCube: texture_2d<f32>;
 @group(1) @binding(4) var noise2D: texture_2d<f32>;
+@group(1) @binding(5) var heightTex: texture_2d<f32>; // @unfilterable
+@group(1) @binding(6) var normalTex: texture_2d<f32>;
+@group(1) @binding(7) var macroTex: texture_2d<f32>;
+@group(1) @binding(8) var shadowMap: texture_depth_2d_array;
 </script>
 
 <script type="text/wgsl" id="sky_fn">
@@ -518,20 +529,487 @@ fn skyColor(dir: vec3f, withSun: f32) -> vec3f {
 #include sky_fn
 @fragment fn fs(in: FSOut) -> @location(0) vec4f {
   let rd = normalize(viewRay(in.uv));
-  var col = skyColor(rd, 1.0);
-  // M2 暫用：格線地面（M3 換成地形與水面）
-  let ro = F.camPos.xyz;
-  let tg = -ro.y / min(rd.y, -1e-5);
-  let pg = ro + rd * tg;
-  let fw = fwidth(pg.xz / 500.0);
-  if (rd.y < 0.0) {
-    let g = abs(fract(pg.xz / 500.0 - 0.5) - 0.5) / fw;
-    let line = 1.0 - saturate(min(g.x, g.y));
-    let n = vec3f(0.0, 1.0, 0.0);
-    let ground = (vec3f(0.12) + vec3f(0.3) * line) * (ambient(n) + F.sunIllum.rgb * max(F.sunDir.y, 0.0) / PI);
-    col = mix(ground, col, saturate(tg / 30000.0));
+  return vec4f(skyColor(rd, 1.0), 1.0);
+}
+</script>
+
+<script type="text/wgsl" id="terrain_gen">
+// ── terrain_gen：啟動時產生一次高度圖（r32float）。macroTex 由 JS 依場景配置畫出：
+//    R＝基準高度（m，水域為負）、G＝丘陵量、B＝鋪面、A＝市鎮 ──
+#include common
+#include fullscreen
+@group(1) @binding(0) var macroTex: texture_2d<f32>;
+fn grad2(p: vec2f) -> vec2f {
+  let a = hash21(p + 4096.0) * TAU;
+  return vec2f(cos(a), sin(a));
+}
+fn gnoise(p: vec2f) -> f32 {   // 梯度雜訊，約 −1..1
+  let i = floor(p);
+  let f = p - i;
+  let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  let a = dot(grad2(i), f);
+  let b = dot(grad2(i + vec2f(1.0, 0.0)), f - vec2f(1.0, 0.0));
+  let c = dot(grad2(i + vec2f(0.0, 1.0)), f - vec2f(0.0, 1.0));
+  let d = dot(grad2(i + vec2f(1.0, 1.0)), f - vec2f(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y) * 1.4;
+}
+fn fbm(p0: vec2f, oct: i32) -> f32 {
+  var p = p0;
+  var s = 0.0;
+  var a = 0.5;
+  for (var i = 0; i < oct; i++) {
+    s += a * gnoise(p);
+    p = mat2x2f(1.6, 1.2, -1.2, 1.6) * p;
+    a *= 0.5;
   }
+  return s;
+}
+@fragment fn fs(in: FSOut) -> @location(0) vec4f {
+  let p = (in.uv - 0.5) * (2.0 * MAP_HALF);
+  let m = textureSampleLevel(macroTex, sLin, in.uv, 0.0);
+  var h = m.r;
+  // 丘陵：domain-warped FBM＋脊狀起伏
+  let q = p / 2100.0 + vec2f(37.0, 91.0);
+  let w = vec2f(fbm(q + vec2f(1.7, 9.2), 4), fbm(q + vec2f(8.3, 2.8), 4));
+  let n = fbm(q + 0.8 * w, 8);
+  let rdg = 1.0 - abs(fbm(q * 1.9 + w * 0.6 + vec2f(5.0, 3.0), 6));
+  let e = saturate(0.5 + 0.9 * n);
+  h += m.g * (20.0 + 230.0 * pow(e, 1.5) + 50.0 * rdg * rdg * e);
+  // 自然地表的小起伏（鋪面區保持平整）
+  let land = smoothstep(0.5, 3.0, m.r);
+  h += land * (1.0 - m.b) * (1.0 - m.g) * (1.5 + 2.5 * fbm(p / 160.0, 4));
+  h += (1.0 - land) * 0.8 * fbm(p / 90.0, 3);
+  return vec4f(h, 0.0, 0.0, 1.0);
+}
+</script>
+
+<script type="text/wgsl" id="terrain_fn">
+// ── terrain_fn：查高度圖（r32float 不能用線性取樣器，手動雙線性）。需要 scene_tex ──
+fn mapUv(xz: vec2f) -> vec2f { return xz / (2.0 * MAP_HALF) + 0.5; }
+fn terrainH(xz: vec2f, mip: i32) -> f32 {
+  let dim = vec2i(textureDimensions(heightTex, mip));
+  let t = mapUv(xz) * vec2f(dim) - 0.5;
+  let fl = floor(t);
+  let i = vec2i(fl);
+  let f = t - fl;
+  let mx = dim - vec2i(1);
+  let a = textureLoad(heightTex, clamp(i, vec2i(0), mx), mip).r;
+  let b = textureLoad(heightTex, clamp(i + vec2i(1, 0), vec2i(0), mx), mip).r;
+  let c = textureLoad(heightTex, clamp(i + vec2i(0, 1), vec2i(0), mx), mip).r;
+  let d = textureLoad(heightTex, clamp(i + vec2i(1, 1), vec2i(0), mx), mip).r;
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+</script>
+
+<script type="text/wgsl" id="lighting">
+// ── lighting：不透明表面的光照（太陽＋天空環境光）。需要 sky_fn ──
+struct Surf { pos: vec3f, n: vec3f, albedo: vec3f, rough: f32, metal: f32, ao: f32, emis: vec3f };
+// 太陽陰影：cascaded shadow maps＋旋轉 Poisson 取樣的 PCF（SHADOW_TAPS 由畫質等級決定）
+fn sunShadow(pos: vec3f, n: vec3f) -> f32 {
+  let nc = i32(F.shadowPrm.x);
+  let vd = dot(pos - F.camPos.xyz, F.camFwd.xyz);
+  var ci = nc;
+  for (var i = nc - 1; i >= 0; i--) { if (vd < F.shadowSplit[i]) { ci = i; } }
+  if (ci >= nc) { return 1.0; }
+  let tex = F.shadowTexel[ci];
+  let p = pos + n * (tex * 1.8) + F.shadowDir.xyz * (tex * 1.2);
+  let sp = F.shadowVP[ci] * vec4f(p, 1.0);
+  let uv = sp.xy * vec2f(0.5, -0.5) + 0.5;
+  if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) { return 1.0; }
+  var pd = array<vec2f, 16>(
+    vec2f(-0.94, -0.40), vec2f(0.95, -0.77), vec2f(-0.09, -0.93), vec2f(0.34, 0.29), vec2f(-0.92, 0.46), vec2f(-0.82, -0.88), vec2f(-0.38, 0.28), vec2f(0.97, 0.76),
+    vec2f(0.44, -0.98), vec2f(0.54, 0.99), vec2f(-0.26, -0.42), vec2f(0.79, 0.19), vec2f(-0.24, 1.00), vec2f(-0.81, 0.91), vec2f(0.02, -0.51), vec2f(0.14, -0.14));
+  let a = hash21(floor(pos.xz * 3.0) + floor(pos.y * 3.0) * 17.0) * TAU;
+  let cs = cos(a); let sn = sin(a);
+  let rad = F.shadowPrm.z / F.shadowPrm.y;
+  var s = 0.0;
+  for (var i = 0; i < SHADOW_TAPS; i++) {
+    let o = vec2f(pd[i].x * cs - pd[i].y * sn, pd[i].x * sn + pd[i].y * cs) * rad;
+    s += textureSampleCompareLevel(shadowMap, sShadow, uv + o, ci, sp.z);
+  }
+  s /= f32(SHADOW_TAPS);
+  // 最後一層的遠端淡出
+  if (ci == nc - 1) { s = mix(s, 1.0, smoothstep(0.85, 1.0, vd / F.shadowSplit[ci])); }
+  return s;
+}
+fn shade(s: Surf, V: vec3f) -> vec3f {
+  let L = F.sunDir.xyz;
+  let nl = saturate(dot(s.n, L));
+  let H = normalize(L + V);
+  let nh = saturate(dot(s.n, H));
+  let nv = max(dot(s.n, V), 1e-3);
+  let vh = saturate(dot(V, H));
+  let a = max(s.rough * s.rough, 0.02);
+  let a2 = a * a;
+  let dd = nh * nh * (a2 - 1.0) + 1.0;
+  let D = a2 / (PI * dd * dd);
+  let k = a * 0.5;
+  let Vis = 0.25 / ((nl * (1.0 - k) + k) * (nv * (1.0 - k) + k));
+  let F0 = mix(vec3f(0.04), s.albedo, s.metal);
+  let Fr = F0 + (vec3f(1.0) - F0) * pow(1.0 - vh, 5.0);
+  let diff = s.albedo * (1.0 - s.metal) / PI;
+  var col = vec3f(0.0);
+  if (nl > 0.0) { col = (diff + D * Vis * Fr) * F.sunIllum.rgb * nl * sunShadow(s.pos, s.n); }
+  col += s.albedo * (1.0 - s.metal) * ambient(s.n) * s.ao;
+  col += F0 * ambient(reflect(-V, s.n)) * s.metal * s.ao * (1.0 - 0.5 * s.rough);
+  return col + s.emis;
+}
+</script>
+
+<script type="text/wgsl" id="terrain">
+// ── terrain：以相機為中心的 clipmap 環；外緣用 CDLOD 式 morph 接到粗一層，沒有裂縫 ──
+#include common
+#include atmo_fn
+#include scene_tex
+#include atmo_lut_fn
+#include sky_lut_map
+#include sky_fn
+#include terrain_fn
+#include lighting
+struct TerrainU {
+  levels: array<vec4f, 10>,   // xy＝中心 xz（已對齊格點），z＝格距（m），w＝高度圖 mip
+  inner: array<vec4f, 10>,    // 細一層涵蓋的範圍 xmin, zmin, xmax, zmax（這個範圍內不畫）
+  prm: vec4f,                 // x＝每邊格數 N，y＝層數
+};
+@group(2) @binding(0) var<uniform> T: TerrainU;
+struct VOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f, @location(1) @interpolate(flat) lvl: u32 };
+@vertex fn vs(@location(0) g: vec2f, @builtin(instance_index) inst: u32) -> VOut {
+  let L = T.levels[inst];
+  let Lc = T.levels[min(inst + 1u, u32(T.prm.y) - 1u)];
+  let N = T.prm.x;
+  let rel = g - N * 0.5;
+  let d = max(abs(rel.x), abs(rel.y)) / (N * 0.5);
+  let k = smoothstep(0.70, 0.90, d);
+  let odd = fract(g * 0.5) * 2.0;          // 奇數格點在外緣併到相鄰的偶數格點（＝粗一層的格點）
+  let xz = L.xy + (rel - odd * k) * L.z;
+  let h = mix(terrainH(xz, i32(L.w)), terrainH(xz, i32(Lc.w)), k);
+  var o: VOut;
+  o.wp = vec3f(xz.x, h, xz.y);
+  o.pos = F.viewProj * vec4f(o.wp, 1.0);
+  o.lvl = inst;
+  return o;
+}
+@fragment fn fs(in: VOut) -> @location(0) vec4f {
+  let uv = mapUv(in.wp.xz);
+  let nt = textureSample(normalTex, sLin, uv);
+  let nz = textureSample(noise2D, sRep, in.wp.xz / 420.0);
+  let nz2 = textureSample(noise2D, sRep, in.wp.xz / 61.0);
+  let dn1 = textureSample(noise2D, sRep, in.wp.xz / 128.0).rg - 0.5;
+  let dn2 = textureSample(noise2D, sRep, in.wp.xz / 13.0).gr - 0.5;
+  if (in.lvl > 0u) {
+    let r = T.inner[in.lvl];
+    if (in.wp.x > r.x && in.wp.z > r.y && in.wp.x < r.z && in.wp.z < r.w) { discard; }
+  }
+  let mac = textureSampleLevel(macroTex, sLin, uv, 0.0);
+  var n = normalize(nt.xyz * 2.0 - 1.0);
+  let slope = 1.0 - n.y;
+  let paved = smoothstep(0.35, 0.65, mac.b);
+  let city = smoothstep(0.4, 0.7, mac.a) * (1.0 - paved);
+  let h = in.wp.y;
+  // 自然地表：草地 → 樹林（丘陵）→ 陡坡露岩 → 岸邊沙地
+  let grass = mix(vec3f(0.085, 0.105, 0.045), vec3f(0.17, 0.165, 0.075), nz.r);
+  let forest = mix(vec3f(0.028, 0.052, 0.022), vec3f(0.065, 0.092, 0.036), nz2.g);
+  let rock = mix(vec3f(0.20, 0.175, 0.15), vec3f(0.31, 0.28, 0.245), nz2.r);
+  var alb = mix(grass, forest, smoothstep(0.12, 0.55, mac.g + (nz.g - 0.5) * 0.5));
+  alb = mix(alb, rock, smoothstep(0.30, 0.55, slope + (nz2.r - 0.5) * 0.2));
+  alb = mix(alb, vec3f(0.40, 0.35, 0.27), smoothstep(2.4, 0.7, h) * (1.0 - paved));
+  // 鋪面（混凝土、柏油）與市鎮地面
+  let conc = mix(vec3f(0.17, 0.17, 0.165), vec3f(0.27, 0.265, 0.25), nz2.r * 0.7 + nz.g * 0.3);
+  alb = mix(alb, conc, paved);
+  alb = mix(alb, mix(vec3f(0.11, 0.11, 0.115), vec3f(0.21, 0.20, 0.19), nz2.g), city);
+  alb = mix(vec3f(0.07, 0.08, 0.065), alb, smoothstep(-1.2, 0.4, h));   // 水面下的海床
+  let rough = (1.0 - paved) * (1.0 - city);
+  n = normalize(n + vec3f(dn1.x, 0.0, dn1.y) * (0.06 + 1.0 * rough) + vec3f(dn2.x, 0.0, dn2.y) * (0.05 + 0.3 * rough));
+  var s: Surf;
+  s.pos = in.wp; s.n = n; s.albedo = alb; s.rough = 0.92; s.metal = 0.0; s.ao = 1.0; s.emis = vec3f(0.0);
+  return vec4f(shade(s, normalize(F.camPos.xyz - in.wp)), 1.0);
+}
+</script>
+
+<script type="text/wgsl" id="water">
+// ── water：海面與港內水面。位置由視線與 y=0 平面的交點算出；法線是多層方向波，
+//    解析不到的小波依距離轉成粗糙度（斜率變異數），太陽光帶才會穩定不閃 ──
+#include common
+#include atmo_fn
+#include scene_tex
+#include atmo_lut_fn
+#include sky_lut_map
+#include sky_fn
+#include terrain_fn
+#include lighting
+struct WOut { @builtin(position) pos: vec4f };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> WOut {
+  let c = vec2f(f32(i & 1u), f32((i >> 1u) & 1u)) * 2.0 - 1.0;
+  let xz = F.camPos.xz + c * 90000.0;
+  var o: WOut;
+  o.pos = F.viewProj * vec4f(xz.x, 0.0, xz.y, 1.0);
+  return o;
+}
+// 一個方向波：回傳 (斜率 x, 斜率 z, 解析不到的斜率變異數)。
+// foot＝像素在水面上的涵蓋範圍 (沿視線方向, 垂直視線方向)；掠射角時沿視線方向會拉得很長
+fn wave(p: vec2f, t: f32, ang: f32, lam: f32, steep: f32, ph: f32, foot: vec2f, vdir: vec2f) -> vec3f {
+  let d = vec2f(cos(ang), sin(ang));
+  let k = TAU / lam;
+  let w = sqrt(9.81 * k);
+  let al = abs(dot(d, vdir));
+  let f = sqrt(foot.x * foot.x * al * al + foot.y * foot.y * (1.0 - al * al));
+  let res = saturate(lam / (f * 2.5) - 0.7);           // 波長比像素涵蓋範圍大多少 → 還看得出來的比例
+  let s = steep * cos(dot(d, p) * k - w * t + ph);
+  return vec3f(d * (s * res), 0.5 * steep * steep * (1.0 - res * res));
+}
+@fragment fn fs(in: WOut) -> @location(0) vec4f {
+  let uv = in.pos.xy * F.viewport.zw;
+  let rd = normalize(viewRay(uv));
+  let ro = F.camPos.xyz;
+  let t = -ro.y / min(rd.y, -1e-6);
+  let p = ro + rd * t;
+  let V = -rd;
+  // 像素在水面上涵蓋的大小（m）
+  let pix = 2.0 * F.camUp.w * F.viewport.w;
+  let foot = vec2f(t * pix / max(-rd.y, 0.004), t * pix);
+  let vdir = normalize(rd.xz);
+  let mac = textureSampleLevel(macroTex, sLin, mapUv(p.xz), 0.0);
+  let depth = -mac.r;
+  let sea = smoothstep(10.5, 16.0, depth);            // 0＝港內（平靜），1＝外海
+  let tm = F.time.x;
+  var acc = vec3f(0.0);
+  // 外海：風浪（主波向大致跟西南風一致）
+  acc += wave(p.xz, tm, -0.75, 46.0, 0.050 * sea, 0.3, foot, vdir);
+  acc += wave(p.xz, tm, -0.35, 27.0, 0.060 * sea, 1.9, foot, vdir);
+  acc += wave(p.xz, tm, -1.15, 15.0, 0.070 * sea, 4.1, foot, vdir);
+  acc += wave(p.xz, tm, -0.55, 8.3, 0.075 * sea, 2.4, foot, vdir);
+  // 細浪（港內也有，但更小）
+  let rp = 0.35 + 0.65 * sea;
+  acc += wave(p.xz, tm, -0.95, 4.1, 0.075 * rp, 5.2, foot, vdir);
+  acc += wave(p.xz, tm, 0.25, 2.3, 0.080 * rp, 0.7, foot, vdir);
+  acc += wave(p.xz, tm, -1.6, 1.3, 0.085 * rp, 3.3, foot, vdir);
+  acc += wave(p.xz, tm, -0.15, 0.71, 0.085 * rp, 1.1, foot, vdir);
+  // 雜訊漣漪（打散規則感）
+  let r1 = textureSample(noise2D, sRep, p.xz / 23.0 + vec2f(0.011, -0.007) * tm).rg - 0.5;
+  let r2 = textureSample(noise2D, sRep, p.xz / 5.7 + vec2f(-0.023, 0.017) * tm).gr - 0.5;
+  let rres = saturate(1.2 - foot.x * 0.25);
+  var slope = acc.xy + (r1 * 0.10 + r2 * 0.14 * rres) * rp;
+  var sv = acc.z + (0.0012 + 0.0026 * (1.0 - rres)) * rp * rp + 0.0009;
+  let N = normalize(vec3f(-slope.x, 1.0, -slope.y));
+  let alpha = clamp(sqrt(2.0 * sv), 0.03, 0.5);
+  let nv = max(dot(N, V), 0.0);
+  // Fresnel（粗糙水面在掠射角的反射率會比鏡面低，用粗糙度往回修正）
+  let fres = 0.02 + 0.98 * pow(1.0 - max(nv, alpha * 0.55), 5.0);
+  // 天空反射：粗糙時反射方向往上偏
+  var R = reflect(rd, N);
+  R.y = abs(R.y) + alpha * 0.35;
+  R = normalize(R);
+  let refl = skyColor(R, 0.0);
+  // 太陽高光（GGX；粗糙度來自斜率變異數）
+  let L = F.sunDir.xyz;
+  let H = normalize(L + V);
+  let nh = saturate(dot(N, H));
+  let nl = saturate(dot(N, L));
+  let a2 = alpha * alpha;
+  let dd = nh * nh * (a2 - 1.0) + 1.0;
+  let D = a2 / (PI * dd * dd);
+  let kk = alpha * 0.5;
+  let Vis = 0.25 / ((nl * (1.0 - kk) + kk) * (nv * (1.0 - kk) + kk));
+  let Fs = 0.02 + 0.98 * pow(1.0 - saturate(dot(V, H)), 5.0);
+  let sh = sunShadow(p, vec3f(0.0, 1.0, 0.0));
+  let spec = F.sunIllum.rgb * min(D * Vis * Fs * nl, 60.0) * sh;
+  // 水體顏色：港內混濁偏綠褐，外海較深較藍
+  let rho = mix(vec3f(0.020, 0.030, 0.024), vec3f(0.006, 0.020, 0.028), sea);
+  let Edown = ambient(vec3f(0.0, 1.0, 0.0)) * PI + F.sunIllum.rgb * max(L.y, 0.0) * sh;
+  var body = rho * Edown / PI * 3.0;
+  // 淺水：透出一點底色；岸邊泡沫
+  let hh = terrainH(p.xz, 0);
+  let shallow = smoothstep(-2.5, -0.2, hh);
+  body = mix(body, vec3f(0.16, 0.15, 0.11) * Edown / PI, shallow * 0.6);
+  let fn_ = textureSample(noise2D, sRep, p.xz / 9.0 + vec2f(0.02, 0.013) * tm).b;
+  let foam = smoothstep(-0.9, -0.05, hh + (fn_ - 0.6) * 0.8) * (0.3 + 0.7 * sea);
+  var col = mix(body, refl, fres) + spec;
+  col = mix(col, vec3f(0.55) * Edown / PI, foam * 0.75);
   return vec4f(col, 1.0);
+}
+</script>
+
+<script type="text/wgsl" id="mesh_io">
+// ── mesh_io：設施網格的頂點格式與 instance 變換（主場景與陰影共用）──
+struct MIn {
+  @location(0) pos: vec3f, @location(1) nrm: vec3f, @location(2) me: vec2f,     // me＝(材質代號, 額外參數)
+  @location(4) r0: vec4f, @location(5) r1: vec4f, @location(6) r2: vec4f,       // instance：3×4 仿射矩陣的三列
+  @location(7) col: vec4f,                                                      // instance：rgb 顏色，a＝材質代號（整數部分）＋亂數種子（小數部分）
+};
+fn instPos(v: MIn) -> vec3f {
+  let p = vec4f(v.pos, 1.0);
+  return vec3f(dot(v.r0, p), dot(v.r1, p), dot(v.r2, p));
+}
+fn instScale(v: MIn) -> vec3f {
+  return vec3f(length(vec3f(v.r0.x, v.r1.x, v.r2.x)), length(vec3f(v.r0.y, v.r1.y, v.r2.y)), length(vec3f(v.r0.z, v.r1.z, v.r2.z)));
+}
+</script>
+
+<script type="text/wgsl" id="shadow">
+// ── shadow：陰影 pass（只寫深度）。每個 cascade 一個小 uniform 指定要用哪個矩陣 ──
+#include common
+#include mesh_io
+struct CasU { idx: vec4f };
+@group(1) @binding(0) var<uniform> C: CasU;
+@vertex fn vs(v: MIn) -> @builtin(position) vec4f {
+  return F.shadowVP[u32(C.idx.x)] * vec4f(instPos(v), 1.0);
+}
+</script>
+
+<script type="text/wgsl" id="mesh">
+// ── mesh：工業設施（instancing）。材質全部程序生成：依物件自己的座標（公尺）畫色帶、窗格、焊道、鏽痕 ──
+#include common
+#include atmo_fn
+#include scene_tex
+#include atmo_lut_fn
+#include sky_lut_map
+#include sky_fn
+#include terrain_fn
+#include lighting
+#include mesh_io
+struct MOut {
+  @builtin(position) pos: vec4f,
+  @location(0) wp: vec3f, @location(1) wn: vec3f, @location(2) lp: vec3f, @location(3) ln: vec3f,
+  @location(4) @interpolate(flat) mat: f32, @location(5) @interpolate(flat) col: vec4f, @location(6) ex: f32,
+};
+@vertex fn vs(v: MIn) -> MOut {
+  var o: MOut;
+  let sc = instScale(v);
+  o.wp = instPos(v);
+  let nl = v.nrm / (sc * sc);                    // 法線要用逆轉置矩陣（非等比縮放時才正確）
+  o.wn = normalize(vec3f(dot(v.r0.xyz, nl), dot(v.r1.xyz, nl), dot(v.r2.xyz, nl)));
+  o.lp = v.pos * sc;
+  o.ln = v.nrm;
+  o.mat = v.me.x; o.ex = v.me.y; o.col = v.col;
+  o.pos = F.viewProj * vec4f(o.wp, 1.0);
+  return o;
+}
+fn palette(h: f32) -> vec3f {                    // 貨櫃常見顏色
+  var p = array<vec3f, 8>(vec3f(0.40, 0.07, 0.05), vec3f(0.05, 0.15, 0.34), vec3f(0.07, 0.26, 0.15), vec3f(0.58, 0.21, 0.04),
+                          vec3f(0.40, 0.41, 0.42), vec3f(0.68, 0.68, 0.66), vec3f(0.05, 0.28, 0.31), vec3f(0.60, 0.47, 0.06));
+  return p[u32(clamp(h, 0.0, 0.999) * 8.0)];
+}
+@fragment fn fs(in: MOut) -> @location(0) vec4f {
+  var mat = i32(in.mat + 0.5);
+  let seed = fract(in.col.a);
+  if (mat == 255) { mat = i32(floor(in.col.a + 0.001)); }
+  let ln = normalize(in.ln);
+  var n = normalize(in.wn);
+  let top = ln.y > 0.7;
+  // 面內座標（公尺）：hu 沿牆面水平方向、hv 高度；圓柱面用弧長
+  var hu = in.lp.x;
+  if (abs(ln.x) > abs(ln.z)) { hu = in.lp.z; }
+  let hv = in.lp.y;
+  let arc = atan2(in.lp.z, in.lp.x) * max(length(in.lp.xz), 1.0);
+  let so = vec2f(seed * 37.0, seed * 91.0);
+  let n1 = textureSample(noise2D, sRep, vec2f(hu, hv) / 23.0 + so);
+  let n2 = textureSample(noise2D, sRep, vec2f(hu, hv) / 3.3 + so);
+  let stk = textureSample(noise2D, sRep, vec2f(hu / 2.7, hv / 70.0) + so);          // 垂直流痕（平面）
+  let stc = textureSample(noise2D, sRep, vec2f(arc / 2.7, hv / 70.0) + so);         // 垂直流痕（圓柱面）
+  let nt = textureSample(noise2D, sRep, in.lp.xz / 17.0 + so);                       // 頂面
+  let night = F.sunIllum.w;
+  var s: Surf;
+  s.pos = in.wp; s.rough = 0.85; s.metal = 0.0; s.ao = 1.0; s.emis = vec3f(0.0);
+  var alb = vec3f(0.3);
+  let rust = mix(vec3f(0.20, 0.085, 0.035), vec3f(0.30, 0.15, 0.06), n2.g);
+  if (mat == 0) {                                 // 混凝土
+    alb = mix(vec3f(0.27, 0.265, 0.25), vec3f(0.40, 0.39, 0.37), n1.r) * (0.9 + 0.2 * n2.r);
+    alb *= mix(1.0, 0.62, smoothstep(0.52, 0.75, stk.r));
+  } else if (mat == 1) {                          // 油漆鋼材（顏色由 instance 給）
+    alb = in.col.rgb * (0.85 + 0.3 * n1.g);
+    alb = mix(alb, rust, smoothstep(0.60, 0.74, n1.r * 0.6 + n2.r * 0.4) * 0.8);
+    alb *= mix(1.0, 0.7, smoothstep(0.55, 0.8, stk.g));
+    s.rough = 0.55;
+  } else if (mat == 2) {                          // 煙囪：上半段紅白相間的航空警示色帶，下半段是混凝土原色
+    let t = in.ex;
+    let conc = mix(vec3f(0.33, 0.32, 0.30), vec3f(0.45, 0.44, 0.41), nt.r * 0.5 + stc.r * 0.5);
+    let bt = (t - 0.37) / 0.63 * 7.0;
+    let red = fract(bt * 0.5) < 0.5;
+    var band = vec3f(0.74, 0.72, 0.68);
+    if (red) { band = vec3f(0.52, 0.065, 0.04); }
+    let edge = smoothstep(0.0, 0.006, abs(fract(bt + 0.5) - 0.5));
+    alb = mix(conc, band * (0.86 + 0.28 * stc.g), step(0.37, t));
+    alb *= mix(0.8, 1.0, edge);
+    alb *= mix(1.0, 0.55, smoothstep(0.50, 0.78, stc.r) * 0.8);          // 雨水流痕
+    alb *= mix(1.0, 0.35, smoothstep(0.955, 1.0, t));                     // 出口附近的煤灰
+    s.rough = 0.8;
+  } else if (mat == 3 || mat == 16) {             // 建築外牆＋窗（16＝船艛，白色小窗）
+    var fl = 3.6; var bay = 3.3;
+    if (mat == 16) { fl = 2.8; bay = 2.2; }
+    var wall = in.col.rgb * (0.82 + 0.3 * n1.r);
+    if (mat == 16) { wall = vec3f(0.74, 0.73, 0.70) * (0.85 + 0.25 * n1.r); }
+    wall *= mix(1.0, 0.68, smoothstep(0.55, 0.8, stk.r));
+    alb = wall;
+    if (top) { alb = vec3f(0.19, 0.19, 0.185) * (0.8 + 0.4 * nt.r); }
+    else {
+      let cu = fract(hu / bay); let cv = fract(hv / fl);
+      let win = step(0.22, cu) * step(cu, 0.78) * step(0.32, cv) * step(cv, 0.80) * step(1.2, hv);
+      let id = floor(vec2f(hu / bay, hv / fl)) + vec2f(seed * 977.0, seed * 131.0);
+      let h1 = hash21(id);
+      if (win > 0.5) {
+        alb = vec3f(0.035, 0.045, 0.055);
+        s.rough = 0.15;
+        let on = step(0.62, h1) * night;                                  // 入夜後部分窗戶亮燈
+        let warm = mix(vec3f(1.0, 0.62, 0.28), vec3f(0.80, 0.90, 1.0), step(0.55, hash21(id + 7.0)));
+        s.emis = warm * on * (0.006 + 0.012 * hash21(id + 3.0));
+      }
+    }
+  } else if (mat == 4) {                          // 浪板／貨櫃
+    var c = in.col.rgb;
+    if (in.ex > 0.001 && in.ex < 0.995) { c = palette(hash21(vec2f(floor(in.ex * 255.0 + 0.5), floor(hv / 2.6)) + seed * 100.0)); }
+    let rib = sin(hu * TAU / 0.29);
+    alb = c * (0.82 + 0.10 * rib + 0.2 * n1.r);
+    alb = mix(alb, rust, smoothstep(0.66, 0.80, n1.g * 0.5 + n2.g * 0.5) * 0.7);
+    alb *= mix(1.0, 0.72, smoothstep(0.55, 0.8, stk.r));
+    if (top) { alb = c * 0.6 * (0.8 + 0.4 * nt.g); }
+    s.rough = 0.6;
+  } else if (mat == 5) {                          // 深色鋼構、管線
+    alb = mix(vec3f(0.13, 0.13, 0.135), vec3f(0.23, 0.22, 0.21), n1.r);
+    alb = mix(alb, rust, smoothstep(0.55, 0.72, n1.g) * 0.6);
+    s.rough = 0.6; s.metal = 0.5;
+  } else if (mat == 6) {                          // 屋頂、甲板
+    alb = vec3f(0.17, 0.175, 0.17) * (0.75 + 0.5 * nt.r);
+  } else if (mat == 7) {                          // 船殼：水線以下紅色防污漆，上面是船殼色
+    let hull = in.col.rgb * (0.8 + 0.3 * n1.r);
+    alb = mix(vec3f(0.30, 0.06, 0.045), hull, smoothstep(1.0, 1.25, hv + (n1.g - 0.5) * 0.3));
+    alb = mix(alb, rust, smoothstep(0.50, 0.75, stk.r) * 0.55);
+    s.rough = 0.5;
+  } else if (mat == 8) {                          // 白色儲槽：每 2.4 m 一圈焊道，往下的鏽痕與底部污漬
+    alb = vec3f(0.70, 0.69, 0.66) * (0.86 + 0.22 * n1.r);
+    let seam = smoothstep(0.035, 0.0, abs(fract(hv / 2.4) - 0.5) * 2.4 - 1.16);
+    alb *= 1.0 - 0.28 * seam;
+    alb = mix(alb, rust * 1.3, smoothstep(0.56, 0.80, stc.r) * 0.55);
+    alb *= mix(0.62, 1.0, smoothstep(0.0, 2.5, hv + n2.r));
+    if (top) { alb = vec3f(0.60, 0.59, 0.57) * (0.8 + 0.3 * nt.r); }
+    s.rough = 0.45;
+  } else if (mat == 9) {                          // 柏油路＋標線
+    alb = vec3f(0.045, 0.045, 0.05) * (0.8 + 0.5 * nt.r);
+    let w = abs(in.lp.z);
+    let dash = step(fract(in.lp.x / 12.0), 0.4) * smoothstep(0.16, 0.10, w);
+    alb = mix(alb, vec3f(0.55), max(dash, smoothstep(0.12, 0.06, abs(w - 3.3))) * 0.8 * step(0.7, ln.y));
+  } else if (mat == 11) {                         // 自發光（燈具）
+    alb = vec3f(0.02);
+    s.emis = in.col.rgb * night * 0.4;
+  } else if (mat == 12) {                         // 黑（煙囪內壁）
+    alb = vec3f(0.008);
+  } else if (mat == 13) {                         // 消波塊、煤堆
+    alb = in.col.rgb * (0.6 + 0.8 * nt.r * n2.g);
+    s.rough = 0.95;
+  } else if (mat == 14) {                         // 碼頭：混凝土＋邊緣黃線＋黑色防舷材
+    alb = mix(vec3f(0.24, 0.24, 0.23), vec3f(0.36, 0.355, 0.34), nt.r);
+    if (!top) {
+      alb *= mix(0.45, 1.0, smoothstep(0.0, 2.2, hv + n2.r * 0.6));         // 潮間帶較黑
+      alb = mix(alb, vec3f(0.02), step(abs(fract(hu / 9.0) - 0.5), 0.07) * step(1.0, hv));
+    }
+  } else if (mat == 15) {                         // 鋁皮保溫層（塔槽、管線）
+    alb = vec3f(0.58, 0.59, 0.60) * (0.8 + 0.3 * n1.r);
+    alb *= 1.0 - 0.2 * smoothstep(0.03, 0.0, abs(fract(hv / 1.2) - 0.5) * 1.2 - 0.57);
+    s.rough = 0.38; s.metal = 0.85;
+  }
+  // 接近地面的積塵與濺痕
+  alb *= mix(0.78, 1.0, smoothstep(0.0, 1.6, in.wp.y - terrainH(in.wp.xz, 1) + n2.b));
+  s.n = n; s.albedo = alb;
+  return vec4f(shade(s, normalize(F.camPos.xyz - in.wp)), 1.0);
 }
 </script>
 
@@ -927,7 +1405,7 @@ function wgsl(id, defs = {}, consts = {}) {
     return out.join('\n');
   };
   let pre = '';
-  for (const [k, v] of Object.entries(consts)) pre += `const ${k} = ${v};\n`;
+  for (const [k, v] of Object.entries({...GPU.consts, ...consts})) pre += `const ${k} = ${v};\n`;   // GPU.consts＝依畫質等級而定的常數
   return pre + expand(id);
 }
 function mkShader(label, code) {
@@ -1278,11 +1756,50 @@ function buildStatic() {
   RES.black = black.view;
   RES.bloomTex = black.view;
   buildAtmoResources();
+  // 陰影：depth32float 的陣列貼圖，一層一個 cascade
+  const n = TIER.shadowN, res = TIER.shadowRes;
+  SHADOW.tex = device.createTexture({label: 'shadowMap', size: [res, res, n], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING});
+  SHADOW.layers = []; SHADOW.ubo = [];
+  for (let i = 0; i < n; i++) {
+    SHADOW.layers.push(SHADOW.tex.createView({dimension: '2d', baseArrayLayer: i, arrayLayerCount: 1}));
+    const u = new UBO('CasU' + i, 'CasU', WGSL_SRC.shadow); u.set('idx', [i, 0, 0, 0]); u.upload(); SHADOW.ubo.push(u);
+  }
+  RES.shadowMap = SHADOW.tex.createView({dimension: '2d-array'});
+  RES.sShadow = device.createSampler({compare: 'less-equal', magFilter: 'linear', minFilter: 'linear'});
+}
+const SHADOW = {};
+// 穩定的 cascaded shadow maps：每個 cascade 用視錐切片的外接球，並把中心對齊到 texel，鏡頭移動時影子邊緣不會游移
+function updateShadows() {
+  const n = TIER.shadowN, res = TIER.shadowRes;
+  const L = dirFromAzEl(SUN.az, Math.max(SUN.el, 1.6 * DEG));   // 高度角下限：太低時影子無限長
+  const far = n >= 4 ? [220, 900, 3200, 11000] : n === 3 ? [260, 1400, 8000] : [500, 6000];
+  const lr = v3.norm(v3.cross([0, 1, 0], L)), lu = v3.cross(L, lr);
+  const th = Math.tan(S.cam.fov / 2), k2 = th * th * (1 + (RT.w / RT.h) ** 2), D = 9000;
+  let n0 = CAM.near;
+  for (let i = 0; i < n; i++) {
+    const f0 = far[i], c = Math.min(0.5 * (f0 + n0) * (1 + k2), f0), r = Math.sqrt((f0 - c) ** 2 + f0 * f0 * k2), texel = 2 * r / res;
+    const ctr = v3.add(S.cam.pos, v3.scale(CAM.fwd, c));
+    const cx = Math.round(v3.dot(ctr, lr) / texel) * texel, cy = Math.round(v3.dot(ctr, lu) / texel) * texel, cz = v3.dot(ctr, L);
+    const eye = v3.add(v3.add(v3.scale(lr, cx), v3.scale(lu, cy)), v3.scale(L, cz + D));
+    const vp = m4.mul(m4.ortho(-r, r, -r, r, 0, D + r), m4.viewBasis(eye, lr, lu, v3.scale(L, -1)));
+    UFrame.set('shadowVP', vp, i);
+    SHADOW['split' + i] = f0; SHADOW['texel' + i] = texel;
+    n0 = f0;
+  }
+  UFrame.set('shadowSplit', [0, 1, 2, 3].map(i => SHADOW['split' + i] || 1e9))
+    .set('shadowTexel', [0, 1, 2, 3].map(i => SHADOW['texel' + i] || 1))
+    .set('shadowPrm', [n, res, 2.2, 0]).set('shadowDir', [...L, 0]);
 }
 function buildPipelines() {
   const P = GPU.pipelines = {};
-  const depthMain = {format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater-equal'};
+  const depthMain = {format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater'};
   const HDR = [{format: 'rgba16float'}];
+  const GRID = [{arrayStride: 8, attributes: [{shaderLocation: 0, offset: 0, format: 'float32x2'}]}];
+  P.terrain = mkRender({label: 'terrain', id: 'terrain', targets: HDR, samples: TIER.msaa, depth: depthMain, buffers: GRID});
+  P.water = mkRender({label: 'water', id: 'water', targets: HDR, samples: TIER.msaa, depth: depthMain, primitive: {topology: 'triangle-strip', cullMode: 'none'}});
+  P.mesh = mkRender({label: 'mesh', id: 'mesh', targets: HDR, samples: TIER.msaa, depth: depthMain, buffers: MESH_BUFFERS});
+  P.shadow = mkRender({label: 'shadow', id: 'shadow', buffers: MESH_BUFFERS,
+    depth: {format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2.5}});
   P.lutTrans = mkRender({label: 'lutTrans', id: 'lut_trans', targets: HDR});
   P.lutMs = mkRender({label: 'lutMs', id: 'lut_ms', targets: HDR});
   P.lutSky = mkRender({label: 'lutSky', id: 'lut_sky', targets: HDR});
@@ -1292,6 +1809,525 @@ function buildPipelines() {
   if (TIER.msaa > 1) P.resolve = mkRender({label: 'resolve', id: 'resolve', targets: [{format: 'rgba16float'}]});
   P.final = mkRender({label: 'final', id: 'post_final', targets: [{format: presentFormat}]});
 }
+
+// ═══ §J5 場景生成：配置、地形 ════════════════════════════════════════
+// 場景是程序生成的意象（不是真實地圖）。座標：X 東、Z 南，單位 m。
+const WORLD = {
+  half: 12000,          // 地形圖涵蓋 ±12 km（要和 WGSL common 的 MAP_HALF 一致）
+  plain: 3.2,           // 臨海平地的高程 [m]
+  stacks: [{x: -80, z: 260, h: 220}, {x: 0, z: 120, h: 250}, {x: 80, z: -20, h: 200}],
+};
+// 圓角矩形的帶號距離（負＝內部）
+const sdBox = (px, pz, cx, cz, hx, hz, r = 0) => {
+  const dx = Math.abs(px - cx) - hx + r, dz = Math.abs(pz - cz) - hz + r;
+  return Math.min(Math.max(dx, dz), 0) + Math.hypot(Math.max(dx, 0), Math.max(dz, 0)) - r;
+};
+function vnoise2(seed) {
+  const h = (x, y) => { let n = Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(seed, 1442695041) | 0; n = Math.imul(n ^ (n >>> 13), 1274126177); return ((n ^ (n >>> 16)) >>> 0) / 4294967296; };
+  return (x, y) => {
+    const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi, u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+    return lerp(lerp(h(xi, yi), h(xi + 1, yi), u), lerp(h(xi, yi + 1), h(xi + 1, yi + 1), u), v);
+  };
+}
+const MN1 = vnoise2(7), MN2 = vnoise2(19);
+// 場景配置（由東往西）：丘陵 → 儲槽區與貨櫃碼頭 → 內港 → 電廠半島 → 外海；北岸是港區與市鎮。
+// 回傳 [基準高度 m, 丘陵量, 鋪面, 市鎮]
+function macroAt(x, z) {
+  const coastX = -1250 + 170 * Math.sin(z / 1900 + 0.7) + 70 * Math.sin(z / 610 + 2.1) + 240 * (MN1(z / 900, 3.3) - 0.5);
+  const dSea = x - coastX;                                  // 正＝陸側
+  const dBay = sdBox(x, z, 825, -250, 675, 1250, 70);        // 內港：x 150..1500，z −1500..1000
+  const dCh = sdBox(x, z, -650, -1075, 1050, 425, 70);       // 水道：x −1700..400，z −1500..−650（通往外海）
+  const dW = Math.min(dSea, dBay, dCh);
+  const land = smooth(-18, 18, dW);
+  let depth = dSea < 0 ? clamp(5 + (-dSea) * 0.03, 5, 30) : 10;
+  depth = Math.min(depth, 1.2 + Math.max(-dW, 0) * 0.3);
+  let R = land * WORLD.plain - (1 - land) * depth;
+  // 東側丘陵、相機所在的山頭、港口北岸的獨立山丘
+  let hill = smooth(2480, 3800, x + 520 * (MN1(z / 1300, 1.1) - 0.5));
+  const dC = Math.hypot(x - 2980, z + 150), camHill = Math.exp(-dC * dC / (2 * 430 * 430));
+  const dN = Math.hypot(x + 900, (z + 4300) * 0.8), northHill = Math.exp(-dN * dN / (2 * 900 * 900));
+  R += land * (camHill * 62 + northHill * 150);
+  hill = Math.max(hill, northHill * 0.85) * land;
+  // 鋪面：電廠、東岸（儲槽區＋貨櫃碼頭）、北岸港區
+  const pv = Math.min(sdBox(x, z, -560, 550, 660, 1150), sdBox(x, z, 1930, -150, 430, 1500), sdBox(x, z, 250, -1950, 1450, 450));
+  const paved = land * smooth(40, -40, pv) * (1 - smooth(0.05, 0.3, hill));
+  // 市鎮：北邊與南邊的低地
+  const ct = Math.min(sdBox(x, z, 700, -3650, 2100, 1150), sdBox(x, z, 900, 3100, 1900, 1100));
+  const city = land * smooth(120, -120, ct + 300 * (MN2(x / 500, z / 500) - 0.5)) * (1 - smooth(0.1, 0.4, hill));
+  return [R, hill, paved, city];
+}
+const f16 = (() => {
+  const f = new Float32Array(1), u = new Uint32Array(f.buffer);
+  return (v) => {
+    f[0] = v; const x = u[0], s = (x >>> 16) & 0x8000; let e = ((x >>> 23) & 0xff) - 112, m = x & 0x7fffff;
+    if (e <= 0) { if (e < -10) return s; m = (m | 0x800000) >> (1 - e); return s + ((m + 0x1000) >> 13); }
+    if (e >= 31) return s | 0x7c00;
+    return s + (e << 10) + ((m + 0x1000) >> 13);
+  };
+})();
+const TERR = {size: 0, h: null, hmips: null, nmips: null, macro: null, texel: 1};
+// CPU 端查地形高度（雙線性）
+function heightAt(x, z) {
+  if (!TERR.h) return 0;
+  const s = TERR.size, tx = clamp((x / (2 * WORLD.half) + 0.5) * s - 0.5, 0, s - 1.001), tz = clamp((z / (2 * WORLD.half) + 0.5) * s - 0.5, 0, s - 1.001);
+  const xi = Math.floor(tx), zi = Math.floor(tz), fx = tx - xi, fz = tz - zi, h = TERR.h, i = zi * s + xi;
+  return lerp(lerp(h[i], h[i + 1], fx), lerp(h[i + s], h[i + s + 1], fx), fz);
+}
+async function buildTerrain() {
+  const U = GPUTextureUsage, MS = 1024;
+  if (!TERR.macro) {
+    const d = new Uint16Array(MS * MS * 4);
+    for (let j = 0; j < MS; j++) for (let i = 0; i < MS; i++) {
+      const m = macroAt(((i + 0.5) / MS - 0.5) * 2 * WORLD.half, ((j + 0.5) / MS - 0.5) * 2 * WORLD.half), k = (j * MS + i) * 4;
+      d[k] = f16(m[0]); d[k + 1] = f16(m[1]); d[k + 2] = f16(m[2]); d[k + 3] = f16(m[3]);
+    }
+    TERR.macro = d;
+  }
+  const mt = device.createTexture({label: 'macroTex', size: [MS, MS], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.COPY_DST});
+  device.queue.writeTexture({texture: mt}, TERR.macro, {bytesPerRow: MS * 8}, [MS, MS]);
+  RES.macroTex = mt.createView();
+  const size = (TIER.name === 'low' || TIER.name === 'medium') ? 1024 : 2048;
+  if (!TERR.h || TERR.size !== size) {
+    // GPU 產生高度圖 → 回讀（CPU 要用來擺物件、算法線與 mip、相機防穿地）
+    const tmp = mkTex('heightGen', size, size, 'r32float', U.RENDER_ATTACHMENT | U.COPY_SRC);
+    const P = mkRender({label: 'terrainGen', id: 'terrain_gen', targets: [{format: 'r32float'}]});
+    const buf = device.createBuffer({size: size * size * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST});
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginRenderPass({colorAttachments: [{view: tmp.view, loadOp: 'clear', storeOp: 'store'}]});
+    usePipeline(pass, P); pass.draw(3); pass.end();
+    enc.copyTextureToBuffer({texture: tmp}, {buffer: buf, bytesPerRow: size * 4}, [size, size]);
+    device.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const h = new Float32Array(buf.getMappedRange().slice(0));
+    buf.unmap(); buf.destroy(); tmp.destroy();
+    TERR.size = size; TERR.h = h; TERR.texel = 2 * WORLD.half / size;
+    // 高度 mip（box filter）
+    const hm = [h];
+    for (let s = size >> 1; s >= 1; s >>= 1) {
+      const p = hm[hm.length - 1], ps = s * 2, d = new Float32Array(s * s);
+      for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) { const i = y * 2 * ps + x * 2; d[y * s + x] = 0.25 * (p[i] + p[i + 1] + p[i + ps] + p[i + ps + 1]); }
+      hm.push(d);
+    }
+    TERR.hmips = hm;
+    // 法線圖（中央差分）與 mip
+    const n0 = new Uint8Array(size * size * 4), inv = 1 / (2 * TERR.texel);
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+      const xm = Math.max(x - 1, 0), xp = Math.min(x + 1, size - 1), ym = Math.max(y - 1, 0), yp = Math.min(y + 1, size - 1);
+      const dx = (h[y * size + xp] - h[y * size + xm]) * inv, dz = (h[yp * size + x] - h[ym * size + x]) * inv, l = 1 / Math.hypot(dx, 1, dz), k = (y * size + x) * 4;
+      n0[k] = (0.5 - 0.5 * dx * l) * 255; n0[k + 1] = (0.5 + 0.5 * l) * 255; n0[k + 2] = (0.5 - 0.5 * dz * l) * 255; n0[k + 3] = 255;
+    }
+    const nm = [n0];
+    for (let s = size >> 1; s >= 1; s >>= 1) {
+      const p = nm[nm.length - 1], ps = s * 2, d = new Uint8Array(s * s * 4);
+      for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) for (let c = 0; c < 4; c++) { const i = (y * 2 * ps + x * 2) * 4 + c; d[(y * s + x) * 4 + c] = (p[i] + p[i + 4] + p[i + ps * 4] + p[i + ps * 4 + 4]) >> 2; }
+      nm.push(d);
+    }
+    TERR.nmips = nm;
+  }
+  const s = TERR.size, L = TERR.hmips.length;
+  const ht = device.createTexture({label: 'heightTex', size: [s, s], format: 'r32float', mipLevelCount: L, usage: U.TEXTURE_BINDING | U.COPY_DST});
+  const nt = device.createTexture({label: 'normalTex', size: [s, s], format: 'rgba8unorm', mipLevelCount: L, usage: U.TEXTURE_BINDING | U.COPY_DST});
+  for (let i = 0; i < L; i++) {
+    const w = s >> i;
+    device.queue.writeTexture({texture: ht, mipLevel: i}, TERR.hmips[i], {bytesPerRow: w * 4}, [w, w]);
+    device.queue.writeTexture({texture: nt, mipLevel: i}, TERR.nmips[i], {bytesPerRow: w * 4}, [w, w]);
+  }
+  RES.heightTex = ht.createView(); RES.normalTex = nt.createView();
+  // clipmap 格網（所有層共用同一份頂點；層的位置與格距由 uniform 決定）
+  const N = TIER.terrN, vb = new Float32Array((N + 1) * (N + 1) * 2), ib = new Uint32Array(N * N * 6);
+  for (let j = 0, k = 0; j <= N; j++) for (let i = 0; i <= N; i++) { vb[k++] = i; vb[k++] = j; }
+  for (let j = 0, k = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const a = j * (N + 1) + i, b = a + 1, c = a + N + 1, d = c + 1;
+    ib[k++] = a; ib[k++] = c; ib[k++] = b; ib[k++] = b; ib[k++] = c; ib[k++] = d;
+  }
+  TERR.vb = device.createBuffer({size: vb.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST});
+  TERR.ib = device.createBuffer({size: ib.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST});
+  device.queue.writeBuffer(TERR.vb, 0, vb); device.queue.writeBuffer(TERR.ib, 0, ib);
+  TERR.indexCount = ib.length; TERR.levels = 8;
+  TERR.ubo = new UBO('TerrainU', 'TerrainU', WGSL_SRC.terrain);
+  RES.T = TERR.ubo.buf;
+}
+function updateTerrainUniforms() {
+  const N = TIER.terrN, c0 = 576 / N, cx = S.cam.pos[0], cz = S.cam.pos[2], maxMip = TERR.hmips.length - 1;
+  let prev = null;
+  for (let l = 0; l < TERR.levels; l++) {
+    const cell = c0 * 2 ** l, sx = Math.round(cx / (2 * cell)) * 2 * cell, sz = Math.round(cz / (2 * cell)) * 2 * cell;
+    const mip = clamp(Math.round(Math.log2(cell / TERR.texel)), 0, maxMip);
+    TERR.ubo.set('levels', [sx, sz, cell, mip], l);
+    if (prev) { const e = (N / 2 - 1) * prev.cell; TERR.ubo.set('inner', [prev.sx - e, prev.sz - e, prev.sx + e, prev.sz + e], l); }
+    prev = {sx, sz, cell};
+  }
+  TERR.ubo.set('prm', [N, TERR.levels, 0, 0]);
+  TERR.ubo.upload();
+}
+
+// ═══ §J5b 程序網格與場景擺放 ═════════════════════════════════════════
+m4.T = (x, y, z) => { const m = m4.ident(); m[12] = x; m[13] = y; m[14] = z; return m; };
+m4.S = (x, y, z) => { const m = m4.ident(); m[0] = x; m[5] = y; m[10] = z; return m; };
+m4.RY = (a) => { const m = m4.ident(), c = Math.cos(a), s = Math.sin(a); m[0] = c; m[2] = -s; m[8] = s; m[10] = c; return m; };
+m4.RZ = (a) => { const m = m4.ident(), c = Math.cos(a), s = Math.sin(a); m[0] = c; m[1] = s; m[4] = -s; m[5] = c; return m; };
+m4.TRS = (x, y, z, ry = 0, sx = 1, sy = 1, sz = 1) => m4.mul(m4.mul(m4.T(x, y, z), m4.RY(ry)), m4.S(sx, sy, sz));
+// 把 +Y 軸對到 p0→p1（原點放在 p0）
+m4.align = (p0, p1) => {
+  const d = v3.sub(p1, p0), len = v3.len(d), y = v3.scale(d, 1 / len);
+  const x = v3.norm(v3.cross(Math.abs(y[1]) > 0.99 ? [1, 0, 0] : [0, 1, 0], y)), z = v3.cross(x, y), m = m4.ident();
+  m[0] = x[0]; m[1] = x[1]; m[2] = x[2]; m[4] = y[0]; m[5] = y[1]; m[6] = y[2]; m[8] = z[0]; m[9] = z[1]; m[10] = z[2];
+  m[12] = p0[0]; m[13] = p0[1]; m[14] = p0[2];
+  return {m, len};
+};
+// 頂點格式：位置 3、法線 3、材質代號 1、額外參數 1（共 8 個 float）
+const MB = {
+  v: [], idx: [], meshes: {}, cur: null,
+  begin(name) { this.cur = {name, first: this.idx.length}; },
+  end() { this.cur.count = this.idx.length - this.cur.first; this.meshes[this.cur.name] = this.cur; },
+  vtx(M, p, n, mat, ex) {
+    const nx = M[0] * n[0] + M[4] * n[1] + M[8] * n[2], ny = M[1] * n[0] + M[5] * n[1] + M[9] * n[2], nz = M[2] * n[0] + M[6] * n[1] + M[10] * n[2], l = Math.hypot(nx, ny, nz) || 1;
+    this.v.push(M[0] * p[0] + M[4] * p[1] + M[8] * p[2] + M[12], M[1] * p[0] + M[5] * p[1] + M[9] * p[2] + M[13], M[2] * p[0] + M[6] * p[1] + M[10] * p[2] + M[14], nx / l, ny / l, nz / l, mat, ex);
+  },
+  quad(M, a, b, c, d, n, mat, ex = 0) {
+    const i = this.v.length / 8;
+    this.vtx(M, a, n, mat, ex); this.vtx(M, b, n, mat, ex); this.vtx(M, c, n, mat, ex); this.vtx(M, d, n, mat, ex);
+    this.idx.push(i, i + 1, i + 2, i, i + 2, i + 3);
+  },
+  // 法線自動算，並朝向 hint 那一側
+  quadAuto(M, a, b, c, d, hint, mat, ex = 0) {
+    let n = v3.norm(v3.cross(v3.sub(b, a), v3.sub(d, a)));
+    if (v3.dot(n, hint) < 0) n = v3.scale(n, -1);
+    this.quad(M, a, b, c, d, n, mat, ex);
+  },
+  // 底面中心在原點的方塊
+  box(M, sx, sy, sz, mat, topMat = mat, ex = 0, exTop = ex) {
+    const x = sx / 2, z = sz / 2;
+    this.quad(M, [-x, 0, z], [x, 0, z], [x, sy, z], [-x, sy, z], [0, 0, 1], mat, ex);
+    this.quad(M, [x, 0, -z], [-x, 0, -z], [-x, sy, -z], [x, sy, -z], [0, 0, -1], mat, ex);
+    this.quad(M, [x, 0, z], [x, 0, -z], [x, sy, -z], [x, sy, z], [1, 0, 0], mat, ex);
+    this.quad(M, [-x, 0, -z], [-x, 0, z], [-x, sy, z], [-x, sy, -z], [-1, 0, 0], mat, ex);
+    this.quad(M, [-x, sy, z], [x, sy, z], [x, sy, -z], [-x, sy, -z], [0, 1, 0], topMat, exTop);
+    this.quad(M, [-x, 0, -z], [x, 0, -z], [x, 0, z], [-x, 0, z], [0, -1, 0], mat, ex);
+  },
+  // 旋轉體：prof＝[[半徑, 高度, 額外參數], …]，由下往上；法線由輪廓的斜率算
+  lathe(M, prof, seg, mat) {
+    const base = this.v.length / 8, n = prof.length;
+    for (let j = 0; j < n; j++) {
+      const a = prof[Math.max(j - 1, 0)], b = prof[Math.min(j + 1, n - 1)], dr = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dr, dy) || 1;
+      for (let i = 0; i <= seg; i++) {
+        const t = i / seg * Math.PI * 2, c = Math.cos(t), s = Math.sin(t);
+        this.vtx(M, [c * prof[j][0], prof[j][1], s * prof[j][0]], [c * dy / l, -dr / l, s * dy / l], mat, prof[j][2] || 0);
+      }
+    }
+    for (let j = 0; j < n - 1; j++) for (let i = 0; i < seg; i++) {
+      const a = base + j * (seg + 1) + i, b = a + 1, c = a + seg + 1, d = c + 1;
+      this.idx.push(a, c, b, b, c, d);
+    }
+  },
+  beam(M, p0, p1, w, mat, ex = 0) { const A = m4.align(p0, p1); this.box(m4.mul(M, A.m), w, A.len, w, mat, mat, ex); },
+  tube(M, p0, p1, r, seg, mat) { const A = m4.align(p0, p1); this.lathe(m4.mul(M, A.m), [[r, 0], [r, A.len]], seg, mat); },
+};
+function buildMeshes() {
+  if (MB.done) return;
+  const I = m4.ident(), TAU = Math.PI * 2;
+  // 煙囪：標稱高度 250 m（instance 用 Y 縮放改高度）；ex＝高度比例，色帶由著色器畫
+  MB.begin('stack'); {
+    const H = 250, rad = (t) => 5.2 + 6.3 * Math.pow(1 - t, 1.7), prof = [];
+    for (let j = 0; j <= 16; j++) { const t = j / 16; prof.push([rad(t), t * H, t]); }
+    MB.lathe(I, prof, 28, 2);
+    MB.lathe(I, [[5.2, H - 3, 0.99], [5.6, H - 2.6, 0.99], [5.6, H, 1], [4.6, H, 1]], 28, 2);     // 頂緣
+    MB.lathe(I, [[4.6, H, 0], [4.6, H - 10, 0], [0.01, H - 10, 0]], 28, 12);                        // 內壁（黑）
+    for (const t of [0.36, 0.63, 0.9]) { const r = rad(t); MB.lathe(m4.T(0, t * H, 0), [[r, -0.4], [r + 1.8, -0.4], [r + 1.8, 1.1], [r + 1.7, 1.1], [r + 1.7, 0], [r, 0]], 28, 5); }
+  } MB.end();
+  // 球形儲槽
+  MB.begin('sphereTank'); {
+    const R = 9.5, cy = 12.5, prof = [];
+    for (let j = 0; j <= 14; j++) { const p = -Math.PI / 2 + j / 14 * Math.PI; prof.push([Math.max(R * Math.cos(p), 0.01), cy + R * Math.sin(p)]); }
+    MB.lathe(I, prof, 24, 8);
+    for (let k = 0; k < 8; k++) { const a = k / 8 * TAU + 0.2, c = Math.cos(a), s = Math.sin(a); MB.tube(I, [c * 8.7, 0, s * 8.7], [c * 9.45, cy - 0.5, s * 9.45], 0.42, 6, 5); }
+    MB.lathe(m4.T(0, cy + R - 0.35, 0), [[2.4, 0], [2.4, 0.6], [0.01, 0.6]], 10, 5);
+    const sp = (p) => [(R + 0.55) * Math.cos(p), cy + (R + 0.55) * Math.sin(p), 0.7];
+    for (let k = 0; k < 9; k++) MB.beam(I, sp(-0.95 + k * 0.3), sp(-0.65 + k * 0.3), 0.9, 5);
+    MB.beam(I, [sp(-0.95)[0] + 0.6, 0, 0.7], sp(-0.95), 0.9, 5);
+  } MB.end();
+  // 圓柱儲槽：半徑 1、高 1 的單位網格（instance 縮放成實際尺寸）
+  MB.begin('cylTank'); {
+    MB.lathe(I, [[1, 0], [1, 1]], 40, 8);
+    MB.lathe(I, [[1, 1], [0.5, 1.035], [0.01, 1.055]], 40, 8);
+    MB.lathe(I, [[1.0, 0.90], [1.022, 0.90], [1.022, 0.93], [1.0, 0.93]], 40, 5);
+    for (let k = 0; k < 16; k++) { const a0 = k / 16 * 2.2, a1 = (k + 1) / 16 * 2.2; MB.beam(I, [1.035 * Math.cos(a0), k / 16, 1.035 * Math.sin(a0)], [1.035 * Math.cos(a1), (k + 1) / 16, 1.035 * Math.sin(a1)], 0.05, 5); }
+  } MB.end();
+  // 管架：24 m 一節，兩層管線
+  MB.begin('pipeRack'); {
+    for (const x of [-12, -6, 0, 6, 12]) {
+      for (const z of [-3, 3]) MB.box(m4.T(x, 0, z), 0.4, 8.4, 0.4, 5);
+      MB.box(m4.T(x, 5.3, 0), 0.35, 0.35, 6.4, 5); MB.box(m4.T(x, 8.0, 0), 0.35, 0.35, 6.4, 5);
+    }
+    for (const z of [-3, 3]) for (const y of [5.3, 8.0]) MB.box(m4.T(0, y, z), 24, 0.3, 0.3, 5);
+    for (const [z, y, r, m] of [[-2.3, 5.95, 0.28, 15], [-1.5, 5.85, 0.2, 5], [-0.7, 6.0, 0.33, 15], [0.3, 5.85, 0.18, 5], [1.2, 5.95, 0.26, 8], [2.2, 6.0, 0.36, 15], [-2.0, 8.57, 0.22, 5], [-0.9, 8.65, 0.3, 15], [0.4, 8.55, 0.2, 8], [1.8, 8.72, 0.38, 15]])
+      MB.tube(I, [-12, y, z], [12, y, z], r, 6, m);
+  } MB.end();
+  // 單位方塊（材質由 instance 指定；頂面 ex=1）與有山牆屋頂的廠房
+  MB.begin('ubox'); MB.box(I, 1, 1, 1, 255, 255, 0, 1); MB.end();
+  MB.begin('shed'); {
+    MB.box(I, 1, 0.72, 1, 255, 255, 0, 0);
+    MB.quadAuto(I, [-0.5, 0.72, 0.5], [0.5, 0.72, 0.5], [0.5, 1, 0], [-0.5, 1, 0], [0, 1, 0], 255, 1);
+    MB.quadAuto(I, [0.5, 0.72, -0.5], [-0.5, 0.72, -0.5], [-0.5, 1, 0], [0.5, 1, 0], [0, 1, 0], 255, 1);
+    MB.quadAuto(I, [0.5, 0.72, 0.5], [0.5, 0.72, -0.5], [0.5, 1, 0], [0.5, 1, 0], [1, 0, 0], 255, 0);
+    MB.quadAuto(I, [-0.5, 0.72, -0.5], [-0.5, 0.72, 0.5], [-0.5, 1, 0], [-0.5, 1, 0], [-1, 0, 0], 255, 0);
+  } MB.end();
+  // 岸邊貨櫃起重機（前伸臂朝 −x＝水側）
+  MB.begin('craneSTS'); { const m = 255;
+    for (const x of [-13, 13]) for (const z of [-11, 11]) MB.box(m4.T(x, 0, z), 1.9, 49, 1.9, m);
+    for (const x of [-13, 13]) { MB.box(m4.T(x, 5, 0), 1.6, 1.8, 23, m); MB.box(m4.T(x, 30, 0), 1.6, 1.8, 23, m); MB.beam(I, [x, 7, -11], [x, 30, 11], 1.0, m); }
+    for (const z of [-11, 11]) { MB.box(m4.T(0, 47, z), 27, 2.0, 1.6, m); MB.beam(I, [-13, 31, z], [13, 47, z], 1.0, m); }
+    MB.box(m4.T(-17, 49, 0), 92, 3.4, 4.2, m);
+    MB.box(m4.T(12, 52.4, 0), 13, 7, 7, m, m, 0, 1);
+    for (const z of [-4.5, 4.5]) { MB.beam(I, [-13, 52, z], [-8, 79, 0], 1.2, m); MB.beam(I, [13, 52, z], [-8, 79, 0], 1.2, m); }
+    MB.beam(I, [-8, 79, 0], [-38, 52.4, 0], 0.6, m); MB.beam(I, [-8, 79, 0], [-61, 52.4, 0], 0.6, m); MB.beam(I, [-8, 79, 0], [27, 52.4, 0], 0.6, m);
+    MB.box(m4.T(-31, 44.5, 0), 5, 3.2, 6, m);
+    for (const z of [-2, 2]) for (const x of [-32.5, -29.5]) MB.beam(I, [x, 44.5, z], [x, 27, z], 0.12, 5);
+    MB.box(m4.T(-31, 26.3, 0), 2.6, 0.7, 12.4, 5);
+  } MB.end();
+  // 場內門式起重機（RTG）
+  MB.begin('craneRTG'); { const m = 255;
+    for (const x of [-5, 5]) for (const z of [-12, 12]) MB.box(m4.T(x, 0, z), 0.9, 21, 0.9, m);
+    for (const x of [-5, 5]) MB.box(m4.T(x, 20.2, 0), 1.2, 1.6, 25, m);
+    for (const z of [-12, 12]) { MB.box(m4.T(0, 1.2, z), 11, 1.0, 1.1, m); MB.box(m4.T(0, 20.4, z), 11, 1.0, 1.0, m); }
+    MB.box(m4.T(0, 18, 3), 6, 2.2, 3.5, m);
+  } MB.end();
+  // 貨櫃：cstack 是一整疊（Y 縮放＝層數；每層顏色由著色器依層數雜湊）
+  MB.begin('cstack'); MB.box(I, 2.44, 2.59, 12.19, 4, 4, 0.5); MB.end();
+  // 船：長度沿 z（船首朝 −z），水線在 y=0
+  const hull = (L, B, D, draft) => {
+    const st = 14, pts = [];
+    for (let i = 0; i <= st; i++) { const s = i / st; const w = s < 0.1 ? 0.72 + 0.28 * (s / 0.1) : s < 0.72 ? 1 : Math.pow(Math.max(1 - (s - 0.72) / 0.28, 0), 0.62); pts.push([Math.max(w * B / 2, 0.05), L / 2 - s * L]); }
+    for (let i = 0; i < st; i++) {
+      const [w0, z0] = pts[i], [w1, z1] = pts[i + 1];
+      for (const g of [1, -1]) MB.quadAuto(I, [g * w0 * 0.8, -draft, z0], [g * w1 * 0.8, -draft, z1], [g * w1, D, z1], [g * w0, D, z0], [g, 0.2, 0], 7);
+      MB.quad(I, [-w0, D, z0], [w0, D, z0], [w1, D, z1], [-w1, D, z1], [0, 1, 0], 6);
+    }
+    MB.quad(I, [-pts[0][0], D, L / 2], [pts[0][0], D, L / 2], [pts[0][0] * 0.8, -draft, L / 2], [-pts[0][0] * 0.8, -draft, L / 2], [0, 0, 1], 7);
+  };
+  const house = (L, B, D) => {
+    MB.box(m4.T(0, D, L / 2 - 26), B - 3, 20, 15, 16, 6);
+    MB.box(m4.T(0, D + 20, L / 2 - 26), B + 2.5, 3.4, 9, 16, 6);
+    MB.box(m4.T(0, D + 20, L / 2 - 15), 7, 9.5, 8, 255, 5);
+    MB.beam(I, [0, D + 23.4, L / 2 - 28], [0, D + 34, L / 2 - 28], 0.5, 5);
+    MB.beam(I, [0, D, -L / 2 + 9], [0, D + 13, -L / 2 + 9], 0.45, 5);
+  };
+  MB.begin('shipBox'); {   // 貨櫃船
+    const L = 205, B = 32, D = 9.5, R = rng(77);
+    hull(L, B, D, 9); house(L, B, D);
+    const across = Math.floor((B - 4) / 2.6);
+    for (let z = -L / 2 + 24; z < L / 2 - 46; z += 13.4) {
+      const tiers = 2 + Math.floor(R() * 4.5);
+      for (let a = 0; a < across; a++) {
+        const t = Math.max(1, tiers - (R() < 0.3 ? 1 : 0) - ((a === 0 || a === across - 1) && R() < 0.5 ? 1 : 0));
+        MB.box(m4.T((a - (across - 1) / 2) * 2.6, D, z), 2.44, t * 2.59, 12.19, 4, 4, (1 + Math.floor(R() * 250)) / 255);
+      }
+    }
+  } MB.end();
+  MB.begin('shipBulk'); {  // 散裝船
+    const L = 185, B = 30, D = 9;
+    hull(L, B, D, 8); house(L, B, D);
+    for (let k = 0; k < 6; k++) MB.box(m4.T(0, D, -L / 2 + 30 + k * 20.5), B - 9, 1.7, 15, 6, 5);
+    for (let k = 0; k < 3; k++) { const z = -L / 2 + 40 + k * 41; MB.lathe(m4.T(0, D, z), [[1.6, 0], [1.3, 11], [0.01, 11]], 8, 255); MB.beam(I, [0, D + 10, z], [9, D + 17, z - 14], 0.7, 255); }
+  } MB.end();
+  // 火炬塔：三腳桁架＋中央立管
+  MB.begin('flareTower'); {
+    const H = 85, lv = 10, rr = (t) => 7.5 - 6.0 * t, p = (a, t) => [Math.cos(a) * rr(t), t * H, Math.sin(a) * rr(t)];
+    for (let k = 0; k < 3; k++) for (let j = 0; j < lv; j++) {
+      const a = k / 3 * TAU, a2 = a + TAU / 3, t0 = j / lv, t1 = (j + 1) / lv;
+      MB.tube(I, p(a, t0), p(a, t1), 0.32, 5, 5); MB.beam(I, p(a, t1), p(a2, t1), 0.18, 5); MB.beam(I, p(a, t0), p(a2, t1), 0.16, 5);
+    }
+    MB.tube(I, [0, 0, 0], [0, H + 4, 0], 0.55, 8, 5);
+    MB.lathe(m4.T(0, H + 4, 0), [[0.55, 0], [1.0, 0.6], [1.0, 3.2], [0.01, 3.2]], 10, 12);
+  } MB.end();
+  // 製程塔（蒸餾塔、吸收塔）：鋁皮保溫層、環形平台、爬梯、塔頂管線
+  MB.begin('column'); {
+    const R = 2.4, H = 46;
+    MB.lathe(I, [[R * 1.15, 0], [R * 1.15, 3], [R, 3.2], [R, H], [R * 0.8, H + 1.2], [R * 0.4, H + 1.9], [0.01, H + 2.1]], 16, 15);
+    for (const y of [9, 18, 27, 36, 44]) MB.lathe(m4.T(0, y, 0), [[R, -0.3], [R + 1.5, -0.3], [R + 1.5, 1.1], [R + 1.4, 1.1], [R + 1.4, 0], [R, 0]], 16, 5);
+    MB.beam(I, [R + 0.25, 0, 0.9], [R + 0.25, H, 0.9], 0.5, 5);
+    MB.tube(I, [0, H + 2, 0], [R + 2.6, H + 3.4, 0], 0.34, 6, 15); MB.tube(I, [R + 2.6, H + 3.4, 0], [R + 2.6, 6, 0], 0.34, 6, 15);
+  } MB.end();
+  MB.begin('pipeStack'); MB.lathe(I, [[1.9, 0], [1.3, 45], [1.05, 45]], 12, 5); MB.lathe(I, [[1.05, 45], [1.05, 40], [0.01, 40]], 12, 12); MB.end();
+  MB.begin('lightPole'); MB.tube(I, [0, 0, 0], [0, 12, 0], 0.14, 5, 5); MB.beam(I, [0, 12, 0], [1.8, 12.3, 0], 0.12, 5); MB.box(m4.T(1.8, 12.05, 0), 0.7, 0.16, 0.32, 11); MB.end();
+  MB.begin('dome'); { const prof = []; for (let j = 0; j <= 10; j++) { const p = j / 10 * Math.PI / 2; prof.push([Math.max(Math.cos(p), 0.01), Math.sin(p)]); } MB.lathe(I, prof, 32, 255); } MB.end();
+  // 臥式儲槽（軸向沿 x）
+  MB.begin('bullet'); {
+    const R = 2.6, L = 9, prof = [];
+    for (let j = 0; j <= 6; j++) { const p = -Math.PI / 2 + j / 6 * Math.PI / 2; prof.push([Math.max(R * Math.cos(p), 0.01), -L + R * Math.sin(p)]); }
+    for (let j = 0; j <= 6; j++) { const p = j / 6 * Math.PI / 2; prof.push([Math.max(R * Math.cos(p), 0.01), L + R * Math.sin(p)]); }
+    MB.lathe(m4.mul(m4.T(0, 3.7, 0), m4.RZ(Math.PI / 2)), prof, 16, 8);
+    for (const x of [-6, 6]) MB.box(m4.T(x, 0, 0), 1.0, 2.6, 4.2, 0);
+  } MB.end();
+  MB.vdata = new Float32Array(MB.v); MB.idata = new Uint32Array(MB.idx); MB.v = MB.idx = null; MB.done = true;
+}
+const SCENE = {inst: {}, stackIdx: [], lights: [], order: [], data: null};
+function stackHeight(i) { return WORLD.stacks[i].h * S.params.hs / 250; }
+function buildScene() {
+  if (SCENE.data) return;
+  const R = rng(4242), rr = (a, b) => a + (b - a) * R(), pick = (a) => a[Math.floor(R() * a.length)];
+  const gy = (x, z) => heightAt(x, z);
+  // color.a＝材質代號＋種子
+  const add = (mesh, M, color = [0.5, 0.5, 0.5], mat = 0) => { const l = (SCENE.inst[mesh] ||= []); l.push({M, c: color, a: mat + 0.01 + R() * 0.97}); return l.length - 1; };
+  const ub = (x, z, sx, sy, sz, ry, color, mat, yOff = 0) => add('ubox', m4.TRS(x, gy(x, z) - 0.5 + yOff, z, ry, sx, sy + (yOff ? 0 : 0.5), sz), color, mat);
+  const light = (x, y, z, type, power = 1) => SCENE.lights.push([x, y, z, type, power, R()]);
+  const WALLS = [[0.50, 0.49, 0.46], [0.42, 0.44, 0.47], [0.56, 0.53, 0.47], [0.47, 0.47, 0.47], [0.38, 0.40, 0.42]];
+  const PL = WORLD.plain;
+  // ── 電廠：煙囪、鍋爐房、集塵器、脫硫塔、汽機房、煤倉 ──
+  WORLD.stacks.forEach((s, i) => {
+    SCENE.stackIdx[i] = add('stack', m4.ident(), [0.5, 0.5, 0.5], 0);
+    const bx = s.x - 108, bz = s.z;
+    ub(bx, bz, 62, 58, 50, 0, [0.40, 0.42, 0.45], 4);
+    ub(bx - 6, bz, 34, 80, 34, 0, [0.34, 0.36, 0.39], 4);
+    ub(s.x - 55, bz + 2, 34, 27, 32, 0, [0.46, 0.46, 0.44], 0);
+    add('column', m4.TRS(s.x - 24, PL, bz - 6, 0.6, 3.1, 0.86, 3.1), [0.5, 0.5, 0.5], 0);
+    ub(s.x - 13, bz, 16, 6.5, 6.5, 0, [0.42, 0.42, 0.41], 5, 15);
+    for (const dz of [-30, 30]) light(bx, 60, bz + dz, 1, 1.2);
+    light(bx - 6, 82, bz, 2, 0.8);
+  });
+  ub(-262, 120, 38, 36, 440, 0, [0.50, 0.50, 0.48], 3);
+  ub(-320, 120, 60, 14, 380, 0, [0.44, 0.45, 0.46], 4);
+  for (let k = 0; k < 3; k++) { add('dome', m4.TRS(-820, PL, 620 + k * 190, 0, 62, 44, 62), [0.60, 0.60, 0.58], 0); light(-820, 46, 620 + k * 190, 2, 0.6); }
+  for (let k = 0; k < 3; k++) {   // 輸煤棧橋：由煤倉斜上到鍋爐房
+    const p0 = [-760, PL + 20, 620 + k * 190], p1 = [WORLD.stacks[k].x - 114, PL + 62, WORLD.stacks[k].z + 24], A = m4.align(p0, p1);
+    add('ubox', m4.mul(m4.mul(A.m, m4.T(0, 0, 0)), m4.S(4.2, A.len, 4.6)), [0.36, 0.38, 0.40], 4);
+    for (let t = 0.15; t < 0.95; t += 0.2) { const p = v3.lerp(p0, p1, t); add('ubox', m4.TRS(p[0], PL, p[2], 0, 1.2, p[1] - PL, 1.2), [0.3, 0.3, 0.3], 5); }
+  }
+  for (let k = 0; k < 4; k++) add('cylTank', m4.TRS(-520 + k * 62, PL, -330, R() * 6, 19, 15, 19), [0.7, 0.7, 0.7], 0);
+  ub(-420, 520, 70, 12, 90, 0, [0.30, 0.32, 0.30], 5);       // 開關場（簡化成矮棚）
+  ub(-150, 520, 46, 22, 24, 0.0, WALLS[2], 3);                // 行政大樓
+  // 電廠的卸煤碼頭（內港西岸）與散裝船
+  add('craneSTS', m4.TRS(134, PL + 0.4, 500, Math.PI, 0.72, 0.72, 0.72), [0.20, 0.34, 0.50], 1);
+  add('craneSTS', m4.TRS(134, PL + 0.4, 640, Math.PI, 0.72, 0.72, 0.72), [0.20, 0.34, 0.50], 1);
+  add('shipBulk', m4.TRS(176, 0, 575, 0), [0.07, 0.08, 0.10], 1);
+  // ── 碼頭岸壁（把地形的緩坡蓋成筆直的岸線）──
+  const quay = (cx, cz, sx, sz) => add('ubox', m4.TRS(cx, -2.5, cz, 0, sx, PL + 2.9, sz), [0.3, 0.3, 0.3], 14);
+  quay(1516, -250, 40, 2500); quay(134, 175, 40, 1650); quay(825, 1016, 1390, 40); quay(125, -1516, 2750, 40); quay(-550, -634, 1400, 40);
+  // ── 東岸北段：貨櫃碼頭（起重機、貨櫃場、停泊的船）──
+  const CRANE_COL = [[0.55, 0.10, 0.07], [0.12, 0.25, 0.48], [0.62, 0.30, 0.06]];
+  for (const z of [-420, -560, -820, -960, -1210]) {
+    add('craneSTS', m4.TRS(1516, PL + 0.4, z, 0), pick(CRANE_COL), 1);
+    light(1516 - 31, 46, z, 1, 2.2); light(1516 + 12, 60, z, 1, 1.4); light(1516 - 8, 80, z, 2, 0.7); light(1516 - 60, 54, z, 2, 0.5);
+  }
+  add('shipBox', m4.TRS(1474, 0, -690, 0), [0.05, 0.10, 0.20], 1);
+  add('shipBox', m4.TRS(1474, 0, -1085, Math.PI), [0.22, 0.05, 0.04], 1);
+  for (let cx = 0; cx < 5; cx++) for (let bz = 0; bz < 7; bz++) {
+    const x0 = 1566 + cx * 40, z0 = -1380 + bz * 152;
+    for (let i = 0; i < 6; i++) for (let j = 0; j < 11; j++) {
+      const tiers = Math.max(0, Math.round(rr(0.6, 5.2) - (R() < 0.12 ? 3 : 0)));
+      if (tiers > 0) add('cstack', m4.TRS(x0 + i * 2.75, PL, z0 + j * 12.7, 0, 1, tiers, 1), [0.4, 0.4, 0.4], 4);
+    }
+    if ((cx + bz) % 2 === 0) add('craneRTG', m4.TRS(x0 + 7, PL, z0 + rr(10, 120), Math.PI / 2), [0.72, 0.55, 0.08], 1);
+    light(x0 + 28, 30, z0 + 70, 1, 2.0);
+  }
+  // ── 東岸南段：儲槽區、製程區、火炬塔、廠房 ──
+  for (let i = 0; i < 2; i++) for (let k = 0; k < 6; k++) { const x = 2080 + i * 50, z = -240 + k * 28; add('sphereTank', m4.TRS(x, PL, z, R() * 6), [0.7, 0.7, 0.7], 0); if (k % 2 === 0) light(x, 24, z, 0, 0.8); }
+  for (let i = 0; i < 4; i++) for (let k = 0; k < 5; k++) {
+    const x = 1640 + i * 70, z = 60 + k * 70, r = rr(21, 27), h = rr(13, 19);
+    add('cylTank', m4.TRS(x, PL, z, R() * 6, r, h, r), [0.7, 0.7, 0.7], 0); light(x + r + 2, h + 3, z, 0, 0.7);
+  }
+  for (let i = 0; i < 7; i++) for (let k = 0; k < 9; k++) {
+    const x = 1610 + i * 100, z = 460 + k * 95, r = rr(28, 40), h = rr(14, 20);
+    if (x + r < 2330) { add('cylTank', m4.TRS(x, PL, z, R() * 6, r, h, r), [0.7, 0.7, 0.7], 0); if ((i + k) % 2 === 0) light(x + r + 2, h + 3, z, 0, 0.7); }
+  }
+  for (let k = 0; k < 6; k++) { const x = 2000 + k * 15, z = -25 + (k % 2) * 34, sy = rr(0.55, 1.25), sr = rr(0.8, 1.3); add('column', m4.TRS(x, PL, z, R() * 6, sr, sy, sr), [0.5, 0.5, 0.5], 0); light(x, 46 * sy + 4, z, 1, 0.6); light(x + 3, 20 * sy, z, 0, 0.5); }
+  for (const [x, z] of [[2105, -8], [2122, -8], [2140, -8]]) { add('pipeStack', m4.TRS(x, PL, z, 0, 1, rr(0.9, 1.25), 1), [0.4, 0.4, 0.4], 0); ub(x, z + 14, 13, 11, 14, 0, [0.35, 0.33, 0.30], 5); }
+  for (let k = 0; k < 8; k++) add('bullet', m4.TRS(1905 + (k % 4) * 9, PL, -205 + Math.floor(k / 4) * 28, Math.PI / 2), [0.7, 0.7, 0.7], 0);
+  SCENE.flare = [2075, PL + 89, 112];
+  add('flareTower', m4.TRS(2075, PL, 112, 0.3), [0.4, 0.4, 0.4], 0);
+  for (let z = -560; z <= 380; z += 24) add('pipeRack', m4.TRS(1962, PL, z, Math.PI / 2), [0.5, 0.5, 0.5], 0);
+  for (let x = 1572; x <= 2250; x += 24) { add('pipeRack', m4.TRS(x, PL, 38, 0), [0.5, 0.5, 0.5], 0); if (x > 1980) add('pipeRack', m4.TRS(x, PL, -262, 0), [0.5, 0.5, 0.5], 0); }
+  for (let i = 0; i < 3; i++) for (let k = 0; k < 2; k++) {
+    const x = 1850 + i * 140 + (i > 0 ? 40 : 0), z = -470 + k * 105;
+    if (Math.abs(x - 1962) > 50) add('shed', m4.TRS(x, PL - 0.4, z, 0, 96, rr(15, 21), 44), pick(WALLS), 4);
+  }
+  ub(2215, 215, 30, 19, 54, 0, WALLS[0], 3); ub(2255, 300, 22, 11, 36, 0, WALLS[3], 3);
+  // 山腳道路（沿 z 方向）與路燈
+  add('ubox', m4.TRS(2330, PL - 0.25, -100, Math.PI / 2, 2900, 0.5, 9), [0.1, 0.1, 0.1], 9);
+  add('ubox', m4.TRS(1545, PL - 0.2, -250, Math.PI / 2, 2480, 0.5, 9), [0.1, 0.1, 0.1], 9);
+  for (let z = -1500; z <= 1300; z += 46) { add('lightPole', m4.TRS(2336, PL, z, Math.PI), [1.0, 0.62, 0.28], 0); light(2334.2, PL + 12, z, 0, 1.0); }
+  for (let z = -1450; z <= 950; z += 60) { add('lightPole', m4.TRS(1552, PL, z, Math.PI), [0.85, 0.92, 1.0], 0); light(1550.2, PL + 12, z, 1, 1.0); }
+  // ── 北岸：第二個貨櫃碼頭與倉庫 ──
+  for (const x of [-620, -330, 260, 560, 1010]) {
+    add('craneSTS', m4.TRS(x, PL + 0.4, -1516, Math.PI / 2), pick(CRANE_COL), 1);
+    light(x, 46, -1516 + 31, 1, 2.2); light(x, 80, -1516 + 8, 2, 0.7);
+  }
+  add('shipBox', m4.TRS(-470, 0, -1474, Math.PI / 2), [0.06, 0.16, 0.12], 1);
+  add('shipBulk', m4.TRS(420, 0, -1476, -Math.PI / 2), [0.16, 0.05, 0.04], 1);
+  for (let bx = 0; bx < 12; bx++) for (let cz = 0; cz < 3; cz++) {
+    const x0 = -1100 + bx * 225, z0 = -1580 - cz * 44;
+    for (let i = 0; i < 6; i++) for (let j = 0; j < 14; j++) {
+      const tiers = Math.max(0, Math.round(rr(0.4, 5.0) - (R() < 0.15 ? 3 : 0)));
+      if (tiers > 0) add('cstack', m4.TRS(x0 + j * 12.7, PL, z0 - i * 2.75, Math.PI / 2, 1, tiers, 1), [0.4, 0.4, 0.4], 4);
+    }
+    if (bx % 2 === 0) add('craneRTG', m4.TRS(x0 + rr(20, 150), PL, z0 - 7, 0), [0.72, 0.55, 0.08], 1);
+    light(x0 + 90, 30, z0 - 30, 1, 2.0);
+  }
+  for (let k = 0; k < 10; k++) add('shed', m4.TRS(-1050 + k * 270, PL - 0.4, -2130 - (k % 2) * 110, 0, 170, rr(14, 20), 60), pick(WALLS), 4);
+  // ── 市鎮：依 macro 的市鎮遮罩撒建築 ──
+  for (let gz = -4800; gz < 4300; gz += 58) for (let gx = -1500; gx < 2900; gx += 58) {
+    const x = gx + rr(-12, 12), z = gz + rr(-12, 12), m = macroAt(x, z);
+    if (m[3] < 0.62 || R() < 0.22) continue;
+    const tall = R() < 0.06, h = tall ? rr(45, 95) : Math.min(8 + 34 * R() * R(), 42), w = tall ? rr(22, 34) : rr(14, 40), d = tall ? rr(22, 34) : rr(12, 30);
+    ub(x, z, w, h, d, R() < 0.5 ? 0 : Math.PI / 2, pick(WALLS), 3);
+    if (R() < 0.5) light(x + w * 0.6, 9, z + d * 0.6, R() < 0.7 ? 0 : 1, 0.9);
+    if (tall) light(x, gy(x, z) + h + 2, z, 2, 0.5);
+  }
+  // ── 防波堤（港口水道出海口）與外海錨泊的船 ──
+  for (const [a, b] of [[[-1240, -1500], [-1980, -1280]], [[-1240, -650], [-1980, -880]]]) {
+    const dx = b[0] - a[0], dz = b[1] - a[1], len = Math.hypot(dx, dz);
+    add('ubox', m4.TRS((a[0] + b[0]) / 2, -4, (a[1] + b[1]) / 2, Math.atan2(-dz, dx), len, 8.5, 16), [0.33, 0.33, 0.32], 13);
+    light(b[0], 9, b[1], a[1] < -1000 ? 3 : 4, 1.5);
+  }
+  for (let k = 0; k < 9; k++) {
+    const x = rr(-9500, -3000), z = rr(-5200, 5200);
+    add(R() < 0.5 ? 'shipBox' : 'shipBulk', m4.TRS(x, 0, z, rr(0.5, 1.1)), pick([[0.05, 0.10, 0.20], [0.20, 0.05, 0.04], [0.06, 0.07, 0.08], [0.08, 0.15, 0.12]]), 1);
+    light(x, 36, z, 1, 1.6); light(x, 14, z + 40, 1, 0.8); light(x, 14, z - 60, 1, 0.8);
+  }
+  // 煙囪的航空障礙燈（依高度比例放三層；位置在 updateStacks 依實際高度換算）
+  SCENE.stackLights = SCENE.lights.length;
+  WORLD.stacks.forEach((s, i) => { for (const t of [0.36, 0.63, 0.9, 1.0]) for (let k = 0; k < 3; k++) SCENE.lights.push([s.x, t, s.z, 2, 1.6, i * 0.33 + (t === 1.0 ? 0.5 : 0), i, k]); });
+  // 打包成 instance buffer（依網格分組）
+  let n = 0; for (const k in SCENE.inst) n += SCENE.inst[k].length;
+  const data = new Float32Array(n * 16); let o = 0;
+  for (const k in SCENE.inst) {
+    SCENE.order.push({mesh: k, first: o / 16, count: SCENE.inst[k].length});
+    for (const it of SCENE.inst[k]) { it.off = o; writeInst(data, o, it.M, it.c, it.a); o += 16; }
+  }
+  SCENE.data = data; SCENE.count = n;
+}
+function writeInst(d, o, M, c, a) {
+  d[o] = M[0]; d[o + 1] = M[4]; d[o + 2] = M[8]; d[o + 3] = M[12];
+  d[o + 4] = M[1]; d[o + 5] = M[5]; d[o + 6] = M[9]; d[o + 7] = M[13];
+  d[o + 8] = M[2]; d[o + 9] = M[6]; d[o + 10] = M[10]; d[o + 11] = M[14];
+  d[o + 12] = c[0]; d[o + 13] = c[1]; d[o + 14] = c[2]; d[o + 15] = a;
+}
+// 煙囪高度可調：改 instance 的 Y 縮放
+function updateStacks() {
+  WORLD.stacks.forEach((s, i) => {
+    const it = SCENE.inst.stack[SCENE.stackIdx[i]];
+    it.M = m4.TRS(s.x, WORLD.plain, s.z, i * 1.3, 1, stackHeight(i) / 250, 1);
+    writeInst(SCENE.data, it.off, it.M, it.c, it.a);
+    if (SCENE.buf) device.queue.writeBuffer(SCENE.buf, it.off * 4, SCENE.data, it.off, 16);
+  });
+}
+function buildSceneGPU() {
+  buildMeshes(); buildScene();
+  SCENE.vb = device.createBuffer({size: MB.vdata.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST});
+  SCENE.ib = device.createBuffer({size: MB.idata.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST});
+  SCENE.buf = device.createBuffer({size: SCENE.data.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST});
+  device.queue.writeBuffer(SCENE.vb, 0, MB.vdata); device.queue.writeBuffer(SCENE.ib, 0, MB.idata);
+  updateStacks();
+  device.queue.writeBuffer(SCENE.buf, 0, SCENE.data);
+}
+function drawScene(pass) {
+  pass.setVertexBuffer(0, SCENE.vb); pass.setVertexBuffer(1, SCENE.buf); pass.setIndexBuffer(SCENE.ib, 'uint32');
+  for (const o of SCENE.order) { const m = MB.meshes[o.mesh]; pass.drawIndexed(m.count, o.count, m.first, 0, o.first); }
+}
+const MESH_BUFFERS = [
+  {arrayStride: 32, attributes: [{shaderLocation: 0, offset: 0, format: 'float32x3'}, {shaderLocation: 1, offset: 12, format: 'float32x3'}, {shaderLocation: 2, offset: 24, format: 'float32x2'}]},
+  {arrayStride: 64, stepMode: 'instance', attributes: [{shaderLocation: 4, offset: 0, format: 'float32x4'}, {shaderLocation: 5, offset: 16, format: 'float32x4'}, {shaderLocation: 6, offset: 32, format: 'float32x4'}, {shaderLocation: 7, offset: 48, format: 'float32x4'}]},
+];
 
 // ═══ §J6 各個 pass ════════════════════════════════════════════════════
 const SUN = {dir: [0, 1, 0], az: 0, el: 0, illum: [1, 1, 1], night: 0};
@@ -1321,10 +2357,12 @@ function updateFrameUniforms() {
     .set('camFwd', [...CAM.fwd, S.exposure]).set('viewport', [RT.w, RT.h, 1 / RT.w, 1 / RT.h])
     .set('sunDir', [...SUN.dir, SUN.el]).set('sunIllum', [...SUN.illum, SUN.night])
     .set('time', [S.simTime, S.frame, S.modeK, 0]);
+  updateShadows();
   UFrame.upload();
   UPost.set('p0', [S.exposure, 0.0, S.modeK * 0.7, 0.35]).set('p1', [canvas.width, canvas.height, S.frame % 1024, 0]);
   UPost.upload();
   uploadAtmo();
+  updateTerrainUniforms();
 }
 function fsPass(enc, name, P, view) {
   const pass = RP(enc, name, {colorAttachments: [{view, loadOp: 'clear', storeOp: 'store'}]});
@@ -1341,12 +2379,24 @@ function render() {
   if (ATMO.dirty) { fsPass(enc, 'lutTrans', P.lutTrans, LUT.trans.view); fsPass(enc, 'lutMs', P.lutMs, LUT.ms.view); ATMO.dirty = false; }
   fsPass(enc, 'lutSky', P.lutSky, LUT.sky.view);
   fsPass(enc, 'amb', P.amb, LUT.amb.view);
+  // 陰影
+  for (let i = 0; i < TIER.shadowN; i++) {
+    const pass = RP(enc, 'shadow' + i, {colorAttachments: [], depthStencilAttachment: {view: SHADOW.layers[i], depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store'}});
+    usePipeline(pass, P.shadow, {C: SHADOW.ubo[i].buf}, 'c' + i);
+    drawScene(pass);
+    pass.end();
+  }
   // 主場景
   {
     const pass = RP(enc, 'main', {
       colorAttachments: [{view: (RT.msColor || RT.hdr).view, clearValue: [0, 0, 0, 1], loadOp: 'clear', storeOp: 'store'}],
       depthStencilAttachment: {view: RT.depth.view, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'store'},
     });
+    usePipeline(pass, P.terrain);
+    pass.setVertexBuffer(0, TERR.vb); pass.setIndexBuffer(TERR.ib, 'uint32');
+    pass.drawIndexed(TERR.indexCount, TERR.levels);
+    usePipeline(pass, P.mesh); drawScene(pass);
+    usePipeline(pass, P.water); pass.draw(4);
     usePipeline(pass, P.sky); pass.draw(3);
     pass.end();
   }
@@ -1427,7 +2477,8 @@ function updateCamera(dt) {
   const k = 1 - Math.exp(-dt * 8);
   c.vel = v3.lerp(c.vel, want, k);
   c.pos = v3.add(c.pos, v3.scale(c.vel, dt));
-  c.pos[0] = clamp(c.pos[0], -14000, 14000); c.pos[2] = clamp(c.pos[2], -14000, 14000); c.pos[1] = clamp(c.pos[1], 1.5, 6000);
+  c.pos[0] = clamp(c.pos[0], -11500, 11500); c.pos[2] = clamp(c.pos[2], -11500, 11500);
+  c.pos[1] = clamp(c.pos[1], Math.max(heightAt(c.pos[0], c.pos[2]) + 2, 1.5), 6000);   // 不穿地、不潛水
   c.fov = lerp(c.fov, c.fovTarget, 1 - Math.exp(-dt * 2.2));
 }
 
@@ -1521,10 +2572,14 @@ async function start(isRestart) {
     for (const k of Object.keys(RES)) delete RES[k];
     GPU.bglCache.clear(); GPU.gen++;
     TIER = pickTier();
+    GPU.consts = {SHADOW_TAPS: TIER.pcf};
     timerInit();
     buildStatic();
+    await buildTerrain();
+    buildSceneGPU();
     buildPipelines();
     allocTargets();
+    if (!isRestart && !S.camPlaced) { S.cam.pos[1] = heightAt(S.cam.pos[0], S.cam.pos[2]) + 22; S.camPlaced = true; }
     GPU.ready = true; S.resetDt = true;
     console.log(`[海港夕煙] adapter=${GPU.adapterName} | ${GPU.glName} | 軟體渲染=${GPU.software} | 畫質=${TIER.name} | features=${GPU.features.join(',')}`);
     if (!isRestart) {
