@@ -1,7 +1,7 @@
 <!doctype html>
 <!--
 ════════════════════════════════════════════════════════════════════════════
- 海港夕煙  Harbor Plume
+ 煙流擴散視界  WebGPU Gaussian Plume
  單一檔案 WebGPU 作品：臨海工業區的黃昏＋煙流擴散分析（高斯煙流模型）
  設計說明見 DESIGN.md；進度與踩過的坑見 PROGRESS.md。
 
@@ -37,7 +37,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
-<title>海港夕煙</title>
+<title>煙流擴散視界</title>
 <link rel="icon" href="data:,">
 <style>
 /* §CSS ─────────────────────────────────────────────────────────────── */
@@ -137,11 +137,11 @@ button,select{font:inherit;color:var(--ink)}
 </head>
 <body>
 <!-- §HTML ─────────────────────────────────────────────────────────── -->
-<canvas id="gfx" tabindex="0" aria-label="海港夕煙 3D 場景。點一下畫面後可用 W A S D 移動、滑鼠轉視角。"></canvas>
+<canvas id="gfx" tabindex="0" aria-label="煙流擴散視界 3D 場景。點一下畫面後可用 W A S D 移動、滑鼠轉視角。"></canvas>
 
 <div id="fallback" hidden role="alert">
   <div class="box">
-    <h1>海港夕煙</h1>
+    <h1>煙流擴散視界</h1>
     <p id="fallbackMsg">這個瀏覽器不支援 WebGPU，所以畫面無法顯示。<br>請改用最新版的 Chrome 或 Edge，或 Safari 26 以上的版本。</p>
     <p><code id="fallbackDetail"></code></p>
   </div>
@@ -149,7 +149,7 @@ button,select{font:inherit;color:var(--ink)}
 <div id="dbg" hidden></div>
 <div id="stat" hidden></div>
 <div id="ui">
-  <header id="brand"><h1>海港夕煙</h1><p>臨海工業區 · 煙流擴散示意</p></header>
+  <header id="brand"><h1>煙流擴散視界</h1><p>臨海工業區 · 煙流擴散示意</p></header>
   <div id="bar">
     <div class="seg" role="group" aria-label="模式">
       <button class="btn" id="bScene" type="button" aria-pressed="true">景觀</button>
@@ -2376,7 +2376,7 @@ function reportError(text) {
   if (S.errors.length > 40) return;   // 同一個錯誤每幀都會重複，超過就不再記
   console.error(text);
   S.errors.push(text);
-  if (S.errors.length > 40) { GPU.ready = false; console.error('[海港夕煙] 錯誤太多，停止渲染。'); }
+  if (S.errors.length > 40) { GPU.ready = false; console.error('[煙流擴散視界] 錯誤太多，停止渲染。'); }
   if (CFG.debug) { const d = $('#dbg'); d.hidden = false; d.textContent += text + '\n'; }
 }
 window.addEventListener('error', (e) => reportError('[JS] ' + e.message + ' @' + (e.filename || '').split('/').pop() + ':' + e.lineno));
@@ -4241,7 +4241,7 @@ async function start(isRestart) {
     GPU.tex = []; GPU.buf = [];   // 舊 device 的資源已經失效，不用逐一 destroy
     await buildAll();
     if (!isRestart && !S.camPlaced) { S.cam.pos[1] = heightAt(S.cam.pos[0], S.cam.pos[2]) + 22; S.camPlaced = true; }
-    console.log(`[海港夕煙] adapter=${GPU.adapterName} | ${GPU.glName} | 軟體渲染=${GPU.software} | 畫質=${TIER.name} | features=${GPU.features.join(',')}`);
+    console.log(`[煙流擴散視界] adapter=${GPU.adapterName} | ${GPU.glName} | 軟體渲染=${GPU.software} | 畫質=${TIER.name} | features=${GPU.features.join(',')}`);
     if (!isRestart) {
       initInput();
       if (CFG.shot) { S.frozen = true; S.simTime = 40; applyShot(CFG.shot); }

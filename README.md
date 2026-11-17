@@ -1,6 +1,23 @@
-# 海港夕煙 Harbor Plume
+# 煙流擴散視界 WebGPU Gaussian Plume
+
+**線上試玩：https://a65041230.github.io/webgpu-gaussian-plume/** （需要支援 WebGPU 的瀏覽器）
+
+作者：沈慶隆（Ken Shen）
 
 用 WebGPU 在瀏覽器裡即時畫出黃昏的臨海工業港，畫面上的煙流和「擴散分析模式」的地面濃度圖，來自同一套高斯煙流模型。整個作品是一個 `index.html`，不用任何外部函式庫、圖片或 3D 模型。
+
+## 關於這個作品
+
+這是我在轉職「AI 應用／AI 自動化」期間做的學習作品。
+
+我是化學系畢業，做過一年多的煙道採樣。在現場量排放量、排氣溫度、流速的時候，我常想：這些數字到了下風幾公里，會變成多少地面濃度？課本裡的高斯煙流公式能算，但只看公式很難有感覺。
+
+所以我想試試看兩件事：
+
+- 把環境監測的專業知識，寫成 AI 能照著做的規格和驗收標準。
+- 用 AI 協作，把這套模型做成看得見、可以互動、而且算得對的東西。
+
+它是一個還在學習、持續改進中的小作品，不是正式的評估工具。程式碼是和 Claude 協作完成的，分工寫在下面的「AI 協助說明」。
 
 ![黃昏開場畫面：三支煙囪的白煙橫過夕陽](docs/shot-sunset.jpg)
 
@@ -17,7 +34,9 @@
 
 ## 怎麼開
 
-需要支援 WebGPU 的瀏覽器：最新版的 Chrome 或 Edge，或 Safari 26 以上。建議用本機伺服器開啟：
+最簡單的方式是直接開[線上版](https://a65041230.github.io/webgpu-gaussian-plume/)。需要支援 WebGPU 的瀏覽器：最新版的 Chrome 或 Edge，或 Safari 26 以上。
+
+要在自己電腦上跑，用本機伺服器開啟：
 
 ```bash
 python -m http.server 8765 --bind 127.0.0.1
@@ -99,7 +118,7 @@ JavaScript（雙精度）先算出每段下風距離的 σ 和浮升高度，存
 
 | 部分 | 誰做的 |
 |---|---|
-| 需求、驗收標準、要驗證的物理性質 | 使用者（見 `PROMPT.md`） |
+| 需求、驗收標準、要驗證的物理性質 | 作者（見 `PROMPT.md`） |
 | 架構設計與全部程式碼、文件 | Claude（Anthropic）。M1–M7 由 Claude Fable 5.2 完成，之後的修正由 Claude Opus 5.5 完成，commit 訊息有標註 |
 | 驗證 | 自動測試（selftest、bench）＋截圖檢查 |
 
@@ -118,3 +137,8 @@ JavaScript（雙精度）先算出每段下風距離的 σ 和浮升高度，存
 | `PROGRESS.md` | 里程碑、預設值、踩過的坑 |
 | `PROMPT.md` | 原始需求 |
 | `docs/` | README 用的截圖 |
+| `LICENSE` | MIT 授權 |
+
+## 授權
+
+MIT License，Copyright (c) 2026 沈慶隆（Ken Shen）。可以自由使用、修改、散布，但要保留版權聲明。全文見 `LICENSE`。
