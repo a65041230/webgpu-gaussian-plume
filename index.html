@@ -113,8 +113,12 @@ button,select{font:inherit;color:var(--ink)}
 #joy i{position:absolute;left:50%;top:50%;width:48px;height:48px;margin:-24px;border-radius:50%;background:rgba(240,178,92,.45);border:1px solid var(--amber)}
 #lift{position:absolute;right:max(18px,env(safe-area-inset-right));bottom:max(86px,calc(env(safe-area-inset-bottom) + 70px));display:flex;flex-direction:column;gap:10px}
 #lift .btn{width:54px;height:54px;border-radius:50%;padding:0;font-size:18px;touch-action:none}
+#labels{z-index:0}#panel{z-index:3}#bar{z-index:4}
 @media (max-width:700px){
   #brand h1{font-size:17px}#brand p{display:none}
+  #bar{top:max(40px,calc(env(safe-area-inset-top) + 34px));left:8px;right:8px;justify-content:flex-start;gap:6px}
+  #compass{top:86px!important}
+  #panel:not([hidden])~#legend{display:none}
   #panel{top:auto;left:8px;right:8px;bottom:8px;width:auto;max-height:56vh}
   #compass{top:52px;padding:4px 9px 4px 5px}#compass svg{width:32px;height:32px}
   #timebox{left:8px;right:8px;width:auto;bottom:max(10px,env(safe-area-inset-bottom))}
@@ -211,7 +215,7 @@ struct Atmo {
 struct PlumeU {
   wind: vec4f,             // xy＝下風方向 (x,z) 單位向量，z＝平流風速 [m/s]，w＝往下風畫到多遠 [m]
   src: array<vec4f, 3>,    // xyz＝煙囪口世界座標，w＝混合比例係數（f_peak = w / (σy·σz)）
-  prm: vec4f,              // x＝LUT 涵蓋的最遠距離，y＝垂直蜿蜒／水平蜿蜒的比例，z＝水平蜿蜒波長，w＝氣膠霾消光係數（f=1 時）[1/m]
+  prm: vec4f,              // x＝LUT 涵蓋的最遠距離，y＝（未使用；蜿蜒振幅改存在 plumeLUT 第 4 列），z＝水平蜿蜒波長，w＝氣膠霾消光係數（f=1 時）[1/m]
   prm2: vec4f,             // x＝混合層高度（0＝沒有逆溫層），y＝光學深度體積沿光線方向一格的長度，z＝垂直蜿蜒波長，w＝出口半徑
   lv0: vec4f,              // 光空間體積：世界座標 → uvw 的三列（xyz·p + w）
   lv1: vec4f,
@@ -897,7 +901,8 @@ fn perlin(p: vec3f, per: i32) -> f32 {
 // 混合比例 f（煙氣佔的比例）＝ 高斯包絡 × 湍流雜訊；f 查 condLUT 得到凝結水滴的消光係數。
 // f 低於臨界值時水滴蒸發（白煙消失），但污染物還在 —— 只剩很淡的氣膠霾。
 // 水滴消光、霾消光 [1/m]、到煙流外緣的估計距離、(z−中心)/σz、σz、(y−中心)/σy、建議的 raymarch 步長
-struct PD { ext: f32, haze: f32, sdf: f32, dzn: f32, sz: f32, dyn: f32, stp: f32, ao: f32 };   // ao＝團塊凹處的遮蔽
+// stp＝所在煙流內的基本步長（不在任何一道煙流裡時是很大的數）；lim＝到「還沒進入的煙流」外緣的安全步長
+struct PD { ext: f32, haze: f32, sdf: f32, dzn: f32, sz: f32, dyn: f32, stp: f32, ao: f32, lim: f32 };   // ao＝團塊凹處的遮蔽
 fn condBeta(f: f32) -> f32 {
   let t = 1.0 + log2(max(f, 1e-6)) / 12.0;
   if (t <= 0.0) { return 0.0; }
@@ -912,29 +917,34 @@ fn plumeEval(p: vec3f, lod: f32) -> PD {
   let kz = TAU / PL.prm2.z;
   var wsum = 0.0;
   var stepIn = 1e5;
-  var sNear = 0.0;
+  var lim = 1e5;
   for (var i = 0; i < 3; i++) {
     let s = PL.src[i];
     let rel = p - s.xyz;
     let x = dot(rel.xz, wd);
     // 上風側：到煙囪口的距離（不能用到「上風平面」的距離，否則貼著平面走的視線會一直走小步）
-    if (x < -3.0 * r0) { o.sdf = min(o.sdf, max(length(rel) - 5.0 * r0, 2.0)); continue; }
-    if (x > PL.wind.w) { o.sdf = min(o.sdf, x - PL.wind.w + 2.0); continue; }
+    if (x < -3.0 * r0) { let dd = max(length(rel) - 5.0 * r0, 2.0); o.sdf = min(o.sdf, dd); lim = min(lim, dd * 0.6); continue; }
+    if (x > PL.wind.w) { let dd = x - PL.wind.w + 2.0; o.sdf = min(o.sdf, dd); lim = min(lim, max(dd * 0.6, 40.0)); continue; }
     let y = rel.z * wd.x - rel.x * wd.y;
     let t = sqrt(max(x, 0.0) / PL.prm.x);
-    let lut = textureSampleLevel(plumeLUT, sLin, vec2f(t * (511.0 / 512.0) + 0.5 / 512.0, (f32(i) + 0.5) / 4.0), 0.0);
-    // 蜿蜒：隨氣塊平流（ξ = x − u·t），時間平均後會回到高斯包絡
+    let lu = t * (511.0 / 512.0) + 0.5 / 512.0;
+    let lut = textureSampleLevel(plumeLUT, sLin, vec2f(lu, (f32(i) + 0.5) / 4.0), 0.0);
+    let mam = textureSampleLevel(plumeLUT, sLin, vec2f(lu, 3.5 / 4.0), 0.0).rg;   // 蜿蜒振幅 (水平, 垂直)，三支煙囪共用
+    // 蜿蜒：隨氣塊平流（ξ = x − u·t），時間平均後會回到高斯包絡。三個分量的係數平方和／2 = 1（單位變異數）；
+    // 高頻分量的振幅要小，否則中心線太陡，煙流會被扭成薄片，從側面看是一道道銳利的線
     let xi = x - PL.wind.z * F.time.x + f32(i) * 733.0;
-    let my = lut.a * 1.84 * (0.62 * sin(ky * xi) + 0.38 * sin(2.37 * ky * xi + 1.3) + 0.25 * sin(5.3 * ky * xi + 4.1));
-    let mz = lut.a * PL.prm.y * 1.84 * (0.62 * sin(kz * xi + 2.0) + 0.38 * sin(2.11 * kz * xi + 0.4) + 0.25 * sin(4.7 * kz * xi + 5.2));
+    let my = mam.x * (1.288 * sin(ky * xi) + 0.552 * sin(2.37 * ky * xi + 1.3) + 0.184 * sin(5.3 * ky * xi + 4.1));
+    let mz = mam.y * (1.288 * sin(kz * xi + 2.0) + 0.552 * sin(2.11 * kz * xi + 0.4) + 0.184 * sin(4.7 * kz * xi + 5.2));
     let dy = y - my;
     let dz = rel.y - lut.r - mz;
     let smin = min(lut.g, lut.b);
     let d = sqrt(dy * dy / (lut.g * lut.g) + dz * dz / (lut.b * lut.b));
     let sd = (d - 4.2) * smin;
-    if (sd < o.sdf) { o.sdf = sd; sNear = smin; }
-    if (d > 4.2) { continue; }
-    stepIn = min(stepIn, 0.33 * smin);
+    o.sdf = min(o.sdf, sd);
+    // 還沒進入這道煙流：往外緣走 0.6 倍的估計距離（煙流往下風會變粗，不能走滿）；
+    // 下限是局部粗細的 1/4（視線擦過外框時估計距離趨近 0，沒有下限會把步數耗盡）
+    if (d > 4.2) { lim = min(lim, max(0.6 * sd, 0.25 * smin)); continue; }
+    stepIn = min(stepIn, 0.4 * smin);
     // 湍流雜訊附著在氣塊上；團塊大小跟著煙流粗細走（相鄰兩個八度交叉淡化，避免尺度跳變）
     let q = vec3f(xi, dy, dz);
     let lam = clamp(3.2 * smin, 6.0, 3000.0);
@@ -950,13 +960,16 @@ fn plumeEval(p: vec3f, lod: f32) -> PD {
     let shape = nn.r;                                    // 大團塊（Perlin-Worley）
     let far = smoothstep(300.0, 1800.0, x);              // 遠處已經混合均勻，團塊感要淡掉
     let pulse = mix(0.70 + 0.60 * nn.a, 1.0, far);       // 粗細沿軸向起伏 → 一團一團的
-    var dn = d / pulse + (0.5 - shape) * mix(2.1, 0.2, far) + ((0.5 - nn.g) * 0.9 + (0.5 - nn.b) * 0.5) * lod * (1.0 - far);
+    var dn = d / pulse + (0.5 - shape) * mix(2.1, 0.2, far) + ((0.5 - nn.g) * 1.1 + (0.5 - nn.b) * 0.7) * lod * (1.0 - far);
     dn = max(dn, d * 0.62);                              // 雜訊最多把邊緣往外推到一定程度，外框（d=4.2）處密度才會趨近 0
     // 外框（d=4.2）處平滑收到 0：高斯尾巴被硬切的話，從切線方向看會在天空畫出細線
     let g = exp(-0.5 * dn * dn) * smoothstep(-3.0 * r0, -0.5 * r0, x) * smoothstep(4.2, 2.8, d);
     let f = min(s.w / (lut.g * lut.b) * g, 1.0);
     let e = condBeta(f);
-    let hz = PL.prm.w * min(f, 0.03);                    // 氣膠霾：稀釋後才看得出來；靠近煙囪處由水滴主導
+    // 氣膠霾：稀釋後才看得出來；靠近煙囪處由水滴主導（太濃會把白煙染髒）。
+    // 用平滑的飽和曲線，不用 min()：硬截會在煙囪附近形成「均勻的實心管」，從側面看邊緣很銳利。
+    // 往下風畫到 PL.wind.w 為止，最後 40% 平滑淡出（硬切也會留下一道邊）
+    let hz = PL.prm.w * f / (1.0 + f / 0.006) * smoothstep(PL.wind.w, 0.6 * PL.wind.w, x);
     o.ext += e;
     o.haze += hz;
     let wgt = e + hz + 1e-7;
@@ -967,10 +980,8 @@ fn plumeEval(p: vec3f, lod: f32) -> PD {
     wsum += wgt;
   }
   if (wsum > 0.0) { o.dzn /= wsum; o.dyn /= wsum; o.sz /= wsum; o.ao /= wsum; } else { o.sz = 10.0; o.ao = 1.0; }
-  // 步長：在煙流外，往外緣走 0.6 倍的估計距離（煙流往下風會變粗，不能走滿）；在煙流內，用局部粗細的 1/3
-  // 下限是局部粗細的 1/4：視線擦過外框時估計距離趨近 0，沒有下限會一直走小步、把步數耗盡
-  o.stp = max(max(o.sdf, 0.0) * 0.6, 0.25 * sNear);
-  if (stepIn < 1e4) { o.stp = stepIn; }
+  o.stp = stepIn;
+  o.lim = lim;
   return o;
 }
 </script>
@@ -1310,6 +1321,9 @@ struct VOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f, @location(1
   let nz2 = textureSample(noise2D, sRep, in.wp.xz / 61.0);
   let dn1 = textureSample(noise2D, sRep, in.wp.xz / 128.0).rg - 0.5;
   let dn2 = textureSample(noise2D, sRep, in.wp.xz / 13.0).gr - 0.5;
+  let rp = vec2f(0.8 * in.wp.x - 0.6 * in.wp.z, 0.6 * in.wp.x + 0.8 * in.wp.z);   // 轉個角度再取樣，打散重複感
+  let nr1 = textureSample(noise2D, sRep, rp / 173.0);
+  let nr2 = textureSample(noise2D, sRep, rp.yx / 29.0);
   // 分析模式的熱圖：濃度與它在螢幕上的變化率要在任何分支之前算好
   let hcv = heatLoad(in.wp.xz);
   let hlc = log(max(hcv, 1e-9)) / 2.302585;
@@ -1327,15 +1341,31 @@ struct VOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f, @location(1
   let paved = smoothstep(0.35, 0.65, mac.b);
   let city = smoothstep(0.4, 0.7, mac.a) * (1.0 - paved);
   let h = in.wp.y;
-  // 自然地表：草地 → 樹林（丘陵）→ 陡坡露岩 → 岸邊沙地
-  let grass = mix(vec3f(0.085, 0.105, 0.045), vec3f(0.17, 0.165, 0.075), nz.r);
-  let forest = mix(vec3f(0.028, 0.052, 0.022), vec3f(0.065, 0.092, 0.036), nz2.g);
+  // 自然地表：草地 → 樹林（丘陵）→ 陡坡露岩 → 岸邊沙地。
+  // 雜訊用兩組不同尺度、不同旋轉角的取樣相乘混合，避免看得出貼圖重複
+  let mixA = nz.r * 0.55 + nr1.g * 0.45;
+  let mixB = nz2.g * 0.5 + nr2.r * 0.5;
+  let grass = mix(vec3f(0.085, 0.100, 0.045), vec3f(0.155, 0.150, 0.070), mixA);
+  let forest = mix(vec3f(0.032, 0.054, 0.024), vec3f(0.058, 0.082, 0.034), mixB);
   let rock = mix(vec3f(0.20, 0.175, 0.15), vec3f(0.31, 0.28, 0.245), nz2.r);
-  var alb = mix(grass, forest, smoothstep(0.12, 0.55, mac.g + (nz.g - 0.5) * 0.5));
+  var alb = mix(grass, forest, smoothstep(0.12, 0.55, mac.g + (mixA - 0.5) * 0.6));
   alb = mix(alb, rock, smoothstep(0.30, 0.55, slope + (nz2.r - 0.5) * 0.2));
   alb = mix(alb, vec3f(0.40, 0.35, 0.27), smoothstep(2.4, 0.7, h) * (1.0 - paved));
-  // 鋪面（混凝土、柏油）與市鎮地面
-  let conc = mix(vec3f(0.17, 0.17, 0.165), vec3f(0.27, 0.265, 0.25), nz2.r * 0.7 + nz.g * 0.3);
+  // 鋪面：混凝土地坪（每 8 m 一道伸縮縫、深淺不一的補丁與油漬）＋每 140 m 一條的廠區道路（柏油、標線）
+  let pixG = length(F.camPos.xyz - in.wp) * 2.0 * F.camUp.w * F.viewport.w;       // 一個像素在地面上大約多寬
+  var conc = mix(vec3f(0.155, 0.155, 0.150), vec3f(0.265, 0.260, 0.245), nz2.r * 0.45 + nz.g * 0.25 + nr1.r * 0.30);
+  conc *= mix(1.0, 0.72, smoothstep(0.58, 0.80, nr2.g * 0.6 + nz2.b * 0.4));    // 油漬、積水痕
+  let slab = abs(fract(in.wp.xz / 8.0) - 0.5) * 8.0;
+  conc *= 1.0 - 0.30 * (1.0 - smoothstep(0.06, 0.16 + pixG * 0.5, 4.0 - max(slab.x, slab.y))) * saturate(1.5 - pixG * 0.6);
+  let rd = abs(fract((in.wp.xz - vec2f(1675.0, 95.0)) / 140.0 + 0.5) - 0.5) * 140.0;
+  let rdm = min(rd.x, rd.y);
+  let road = 1.0 - smoothstep(4.6, 5.2 + pixG, rdm);
+  var asph = vec3f(0.050, 0.050, 0.054) * (0.75 + 0.5 * nz2.r);
+  let along = select(in.wp.z, in.wp.x, rd.y < rd.x);
+  let dash = step(fract(along / 12.0), 0.45) * (1.0 - smoothstep(0.10, 0.20 + pixG * 0.6, rdm));
+  let edgeL = 1.0 - smoothstep(0.10, 0.20 + pixG * 0.6, abs(rdm - 4.1));
+  asph = mix(asph, vec3f(0.50, 0.48, 0.40), max(dash, edgeL * 0.8) * saturate(1.6 - pixG * 0.35) * 0.85);
+  conc = mix(conc, asph, road);
   alb = mix(alb, conc, paved);
   alb = mix(alb, mix(vec3f(0.11, 0.11, 0.115), vec3f(0.21, 0.20, 0.19), nz2.g), city);
   alb = mix(vec3f(0.07, 0.08, 0.065), alb, smoothstep(-1.2, 0.4, h));   // 水面下的海床
@@ -1710,6 +1740,9 @@ struct MarchOut { @location(0) col: vec4f, @location(1) aux: vec4f };
     let ambUp = ambient(vec3f(0.0, 1.0, 0.0));
     let ambDn = ambient(vec3f(0.0, -1.0, 0.0)) + PL.glow.rgb;
     var t = t0 + jit * max(2.0, t0 * pixA * 2.0);
+    var tPrev = t;
+    var sigPrev = 0.0;
+    var LinPrev = vec3f(0.0);
     for (var i = 0; i < VOL_STEPS; i++) {
       if (t >= t1 || Tp < 0.004) { break; }
       let p = ro + rd * t;
@@ -1718,8 +1751,16 @@ struct MarchOut { @location(0) col: vec4f, @location(1) aux: vec4f };
       let sig = pd.ext + pd.haze;
       // 每一步的長度都加亂數（平均不變）：取樣位置才不會在相鄰像素之間排成等距的「等高線」
       let xi = fract(jit + 0.754878 * f32(i + 1));
-      if (sig < 1e-7) { t += clamp(pd.stp, dsMin, 400.0) * (0.7 + 0.6 * xi); continue; }
-      let ds = clamp(min(pd.stp, 1.4 / sig), dsMin, 90.0) * (0.5 + xi);   // 步長不超過約 1.4 個平均自由徑
+      // 幾乎沒有東西的地方（外面，或煙流尾端淡到看不見的部分）：直接走到下一道煙流的外緣附近
+      // 在某道煙流的範圍內（pd.stp < 1e4）步長不能超過它的幾何尺度，否則會一步跨過整個截面
+      let geo = select(400.0, 2.0 * pd.stp, pd.stp < 1e4);
+      var ds = clamp(min(geo, pd.lim), dsMin, 500.0) * (0.7 + 0.6 * xi);
+      var Lin = vec3f(0.0);
+      if (sig >= 1e-7) {
+      // 步長：很淡的霾可以走大一點（每步的光學深度約 0.03），但最多到煙流粗細的 0.8 倍；濃的地方不超過約 1.4 個平均自由徑；
+      // 而且不能越過「還沒進入的煙流」的外緣（pd.lim），否則會跳過埋在淡霾裡的濃煙。
+      // （之前允許淡霾一步走 500 m，比煙流截面還寬，積分在輪廓附近高估 → 邊緣變成一道硬線）
+      ds = clamp(min(min(max(pd.stp, min(0.03 / sig, geo)), pd.lim), 1.4 / sig), dsMin, 500.0) * (0.5 + xi);
       // 太陽光：查光學深度體積；多重散射用幾個「越來越鈍」的八度近似（厚的地方不會全黑）
       // 體積裡存的是「到體素中心」的累積值，要扣掉取樣點自己這格的一半，迎光面才不會被自己遮暗
       let tauS = max(plumeTau(p) - 0.5 * sig * PL.prm2.y, 0.0);
@@ -1745,18 +1786,37 @@ struct MarchOut { @location(0) col: vec4f, @location(1) aux: vec4f };
       let fv = PL.flare.xyz - p;
       let fl = vec3f(1.0, 0.52, 0.20) * PL.flare.w / (dot(fv, fv) + 900.0) * exp(-td * 0.3);
       let alb = (vec3f(pd.ext) + pd.haze * vec3f(0.93, 0.90, 0.86)) / sig;
-      let Lin = alb * (F.sunIllum.rgb * ms + amb + fl);
-      let sT = exp(-sig * ds);
-      Lp += Tp * (1.0 - sT) * Lin;
-      tw += Tp * (1.0 - sT);
-      twt += Tp * (1.0 - sT) * t;
-      Tp *= sT;
+      Lin = alb * (F.sunIllum.rgb * ms + amb + fl);
+      }
+      // 梯形積分：這個取樣點和上一個取樣點之間的線段，消光取兩端平均。
+      // （只用單端的話，剛進入煙流的那一段會被整段當成空的，在淡霾的外緣形成看得見的界線）
+      let seg = t - tPrev;
+      let sA = 0.5 * (sig + sigPrev);
+      if (sA > 1e-8 && seg > 0.0) {
+        let sT = exp(-sA * seg);
+        Lp += Tp * (1.0 - sT) * (Lin * sig + LinPrev * sigPrev) / (sig + sigPrev);
+        tw += Tp * (1.0 - sT);
+        twt += Tp * (1.0 - sT) * (t - 0.5 * seg);
+        Tp *= sT;
+      }
+      tPrev = t; sigPrev = sig; LinPrev = Lin;
       t += ds;
+    }
+    // 最後一個取樣點到終點（場景表面或外框）的那一段
+    if (sigPrev > 1e-7 && Tp >= 0.004) {
+      let seg = max(min(t, t1) - tPrev, 0.0);
+      let sT = exp(-0.5 * sigPrev * seg);
+      Lp += Tp * (1.0 - sT) * LinPrev;
+      tw += Tp * (1.0 - sT);
+      twt += Tp * (1.0 - sT) * tPrev;
+      Tp *= sT;
     }
   }
   // ── 大氣霧（和天空 LUT 同一個介質）：太陽項會被煙流與建築擋住 → 光柱 ──
+  // 煙流的代表深度（把霧分成煙流前、後兩段用）。不能設門檻：門檻兩側的合成結果差一點點，
+  // 就會沿著「霾的不透明度＝門檻值」的等值線在天空畫出一圈弧線
   var tP = tScene;
-  if (tw > 0.02) { tP = twt / tw; }
+  if (tw > 1e-6) { tP = twt / tw; }
   let tEnd = min(tScene, 40000.0);
   let pR = phaseR(cosT);
   let pM = phaseM(cosT, A.mie.w);
@@ -1803,7 +1863,11 @@ struct MarchOut { @location(0) col: vec4f, @location(1) aux: vec4f };
   } else {
     o.col = vec4f(Af + Tff * Lp + Tp * Ab, Tp * dot(Tf, vec3f(1.0 / 3.0)));
   }
-  o.aux = vec4f(tP, zlin, 0.0, 0.0);
+  o.aux = vec4f(mix(tScene, tP, saturate(tw * 5.0)), zlin, 0.0, 0.0);   // 重投影用的深度：煙流越不透明越偏向煙流的深度
+  // 除錯用（S.dbgVol）：1＝只看煙流的不透明度，2＝只看霧，3＝不合成體積
+  if (F.time.w > 0.5 && F.time.w < 1.5) { o.col = vec4f(vec3f(1.0 - Tp) * 4.0 / F.camFwd.w, 0.0); }
+  if (F.time.w > 1.5 && F.time.w < 2.5) { o.col = vec4f(Af + Ab, dot(Tf, vec3f(1.0 / 3.0))); if (isSky) { o.col = vec4f(Af - Uf + Ab - Ub, 1.0); } }
+  if (F.time.w > 2.5) { o.col = vec4f(0.0, 0.0, 0.0, 1.0); }
   return o;
 }
 </script>
@@ -2040,8 +2104,8 @@ const CFG = {
 const TIERS = {
   ultra:  {name:'ultra',  msaa:4, maxScale:1.0,  minScale:0.7,  shadowN:4, shadowRes:2048, pcf:16, volDiv:2, volSteps:96, fogSteps:24, lvol:[224,112,96], lvolEvery:1, reflDiv:2, reflLevel:3, terrN:128, bloomMips:7, lightFrac:1.0, birds:2000},
   high:   {name:'high',   msaa:4, maxScale:1.0,  minScale:0.6,  shadowN:3, shadowRes:2048, pcf:9,  volDiv:2, volSteps:64, fogSteps:16, lvol:[176,88,72],  lvolEvery:2, reflDiv:2, reflLevel:3, terrN:96,  bloomMips:6, lightFrac:1.0, birds:2000},
-  medium: {name:'medium', msaa:1, maxScale:0.85, minScale:0.5,  shadowN:3, shadowRes:1024, pcf:4,  volDiv:3, volSteps:40, fogSteps:12, lvol:[128,64,32],  lvolEvery:3, reflDiv:4, reflLevel:2, terrN:64,  bloomMips:5, lightFrac:0.7, birds:600},
-  low:    {name:'low',    msaa:1, maxScale:0.7,  minScale:0.45, shadowN:2, shadowRes:1024, pcf:4,  volDiv:4, volSteps:28, fogSteps:8,  lvol:[96,48,24],   lvolEvery:4, reflDiv:4, reflLevel:1, terrN:48,  bloomMips:5, lightFrac:0.5, birds:300},
+  medium: {name:'medium', msaa:1, maxScale:0.85, minScale:0.5,  shadowN:3, shadowRes:1024, pcf:4,  volDiv:3, volSteps:48, fogSteps:12, lvol:[128,64,32],  lvolEvery:3, reflDiv:4, reflLevel:2, terrN:64,  bloomMips:5, lightFrac:0.7, birds:600},
+  low:    {name:'low',    msaa:1, maxScale:0.7,  minScale:0.45, shadowN:2, shadowRes:1024, pcf:4,  volDiv:4, volSteps:36, fogSteps:8,  lvol:[96,48,24],   lvolEvery:4, reflDiv:4, reflLevel:1, terrN:48,  bloomMips:5, lightFrac:0.5, birds:300},
 };
 let TIER = TIERS.high;
 
@@ -3239,6 +3303,21 @@ function buildScene() {
     if (Math.abs(x - 1962) > 50) add('shed', m4.TRS(x, PL - 0.4, z, 0, 96, rr(15, 21), 44), pick(WALLS), 4);
   }
   ub(2215, 215, 30, 19, 54, 0, WALLS[0], 3); ub(2255, 300, 22, 11, 36, 0, WALLS[3], 3);
+  // 前景的細節（提供尺度感）：第二排管架、冷卻水塔、控制室與機房、停放的槽車與貨車、槽區的路燈
+  for (let z = -548; z <= 20; z += 24) add('pipeRack', m4.TRS(1745, PL, z, Math.PI / 2), [0.5, 0.5, 0.5], 0);
+  ub(2270, 360, 16, 15, 92, 0, [0.36, 0.37, 0.36], 0);
+  for (let k = 0; k < 6; k++) add('cylTank', m4.TRS(2270, PL + 15, 322 + k * 15.2, 0, 5.6, 4.2, 5.6), [0.5, 0.5, 0.5], 0);
+  for (const [x, z, sx, sy, sz] of [[1905, -110, 26, 9, 16], [2030, -70, 18, 7, 12], [1860, 20, 14, 6, 22], [2160, 60, 24, 8, 14], [1790, -215, 20, 8, 30], [2240, -300, 28, 10, 18], [1700, -60, 16, 6, 16], [2010, 180, 22, 7, 15]])
+    ub(x, z, sx, sy, sz, 0, pick(WALLS), 3);
+  const TRUCK = [[0.55, 0.56, 0.58], [0.60, 0.14, 0.08], [0.10, 0.22, 0.42], [0.62, 0.50, 0.10], [0.20, 0.34, 0.22], [0.75, 0.75, 0.72]];
+  for (let k = 0; k < 90; k++) {
+    const onRoadX = R() < 0.5, lane = (R() < 0.5 ? -2.2 : 2.2);
+    const x = onRoadX ? 1675 + 140 * Math.floor(rr(0, 5)) + lane : rr(1580, 2290), z = onRoadX ? rr(-560, 420) : 95 + 140 * Math.floor(rr(-5, 3)) + lane;
+    const ry = onRoadX ? Math.PI / 2 : 0, tank = R() < 0.4;
+    add('ubox', m4.TRS(x, PL, z, ry, tank ? 10.5 : rr(7, 12), tank ? 2.9 : rr(2.8, 3.8), 2.5), tank ? [0.66, 0.67, 0.68] : pick(TRUCK), tank ? 15 : 4);
+    add('ubox', m4.TRS(x + (onRoadX ? 0 : 6.4), PL, z + (onRoadX ? -6.4 : 0), ry, 2.3, 2.9, 2.4), pick(TRUCK), 1);
+  }
+  for (let i = 0; i < 5; i++) for (let k = 0; k < 7; k++) { const x = 1675 + i * 140 + 6, z = -520 + k * 140; add('lightPole', m4.TRS(x, PL, z, R() * 6), [1.0, 0.62, 0.28], 0); light(x, PL + 12, z, 0, 0.9); }
   // 山腳道路（沿 z 方向）與路燈
   add('ubox', m4.TRS(2330, PL - 0.25, -100, Math.PI / 2, 2900, 0.5, 9), [0.1, 0.1, 0.1], 9);
   add('ubox', m4.TRS(1545, PL - 0.2, -250, Math.PI / 2, 2480, 0.5, 9), [0.1, 0.1, 0.1], 9);
@@ -3266,7 +3345,7 @@ function buildScene() {
     const x = gx + rr(-12, 12), z = gz + rr(-12, 12), m = macroAt(x, z);
     if (m[3] < 0.62 || R() < 0.22) continue;
     const tall = R() < 0.06, h = tall ? rr(45, 95) : Math.min(8 + 34 * R() * R(), 42), w = tall ? rr(22, 34) : rr(14, 40), d = tall ? rr(22, 34) : rr(12, 30);
-    ub(x, z, w, h, d, R() < 0.5 ? 0 : Math.PI / 2, pick(WALLS), 3);
+    ub(x, z, w, h, d, R() < 0.5 ? 0 : Math.PI / 2, v3.scale(pick(WALLS), rr(0.45, 0.8)), 3);
     if (R() < 0.5) light(x + w * 0.6, 9, z + d * 0.6, R() < 0.7 ? 0 : 1, 0.9);
     if (tall) light(x, gy(x, z) + h + 2, z, 2, 0.5);
   }
@@ -3342,6 +3421,7 @@ function buildLightsGPU() {
   device.queue.submit([enc.finish()]);
 }
 function buildSceneGPU() {
+  SCENE.lbuf = null;   // 重建時舊的燈光 buffer 已經釋放（或屬於失效的 device），updateStacks 不能再寫它
   buildMeshes(); buildScene();
   SCENE.vb = device.createBuffer({size: MB.vdata.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST});
   SCENE.ib = device.createBuffer({size: MB.idata.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST});
@@ -3364,7 +3444,8 @@ const PLUME = {M: null, cond: null, xEvap: 0, pts: [], dirty: true, lvCount: 0};
 // 依穩定度的瞬時煙流參數：[水平瞬時比例, 垂直瞬時比例, 水平蜿蜒波長 m, 垂直蜿蜒波長 m]
 // 瞬時比例＝瞬時煙流寬度佔時間平均 σ 的比例；其餘的擴散由蜿蜒（大渦流把整條煙流甩來甩去）提供。
 // A 級上下翻騰劇烈、D 級接近錐狀、F 級垂直方向幾乎不動（扁平帶狀，只有水平慢擺）。
-const STAB = {A: [0.50, 0.45, 420, 300], B: [0.56, 0.52, 520, 420], C: [0.64, 0.62, 680, 620], D: [0.72, 0.78, 900, 1000], E: [0.80, 0.90, 1500, 2400], F: [0.82, 0.96, 2300, 5000]};
+// 蜿蜒波長（≈ 煙囪口風速 × 大渦流的時間尺度）決定蜿蜒振幅的上限（波長的 1/18），所以不穩定的等級也要夠長，才甩得動。
+const STAB = {A: [0.50, 0.45, 900, 700], B: [0.56, 0.52, 1000, 800], C: [0.64, 0.62, 1100, 1000], D: [0.72, 0.78, 1300, 1400], E: [0.80, 0.90, 1800, 2600], F: [0.82, 0.96, 2600, 5000]};
 const LUT_XMAX = 12000;
 let UPlume = null, ULV = null, UVol = null;
 function buildPlumeResources() {
@@ -3395,7 +3476,7 @@ function updatePlumeModel() {
   const cond = PLUME.cond = PHYS.condensation(p);
   PLUME.max = PHYS.findMax(M);
   // 凝結表：液態水混合比 → 消光係數。β = 3·LWC/(2·ρw·r_eff)，r_eff = 8 μm；再乘 0.35 並設上限，讓邊緣有柔和的過渡
-  const BK = 1.5 * 1.16 / (1000 * 8e-6) * 1.2, cl = new Uint16Array(256 * 4);
+  const BK = 1.5 * 1.16 / (1000 * 8e-6) * 1.6, cl = new Uint16Array(256 * 4);
   for (let i = 0; i < 256; i++) cl[i * 4] = f16(Math.min(cond.lut[i] * BK, 0.36));
   device.queue.writeTexture({texture: PLUME.condTex}, cl, {bytesPerRow: 256 * 8}, [256, 1]);
   const st = STAB[p.cls], r0 = p.d / 2, s0 = r0 / Math.SQRT2, data = new Uint16Array(512 * 4 * 4);
@@ -3405,21 +3486,25 @@ function updatePlumeModel() {
     const fK = Ta / Ts * r0 * r0 * p.vs / (2 * s.us), row = [];
     for (let j = 0; j < 512; j++) {
       const x = (j / 511) ** 2 * LUT_XMAX, sg = PHYS.sigmaK(M.k, Math.max(x, 0.01)), bid = PHYS.dhAt(s, Math.max(x, 0.01)) / 3.5;
-      let dh = bid * 3.5, syi = Math.sqrt(s0 * s0 + bid * bid + (st[0] * sg.sy) ** 2), szi = Math.sqrt(s0 * s0 + bid * bid + (st[1] * sg.sz) ** 2);
-      const ay = Math.sqrt(1 - st[0] * st[0]) * sg.sy, az = Math.sqrt(1 - st[1] * st[1]) * sg.sz;
+      // 蜿蜒振幅有上限（約波長的 1/18）：煙流變粗以後，大渦流甩不動整條煙流，擴散改由煙流本身變寬來完成。
+      // 被截掉的蜿蜒變異數加回瞬時寬度：σ_瞬時² + 蜿蜒² ＝ σ_Briggs²，時間平均仍是同一個高斯包絡
+      const ay = Math.min(Math.sqrt(1 - st[0] * st[0]) * sg.sy, st[2] / 18), az = Math.min(Math.sqrt(1 - st[1] * st[1]) * sg.sz, st[3] / 18);
+      let dh = bid * 3.5, syi = Math.sqrt(s0 * s0 + bid * bid + sg.sy * sg.sy - ay * ay), szi = Math.sqrt(s0 * s0 + bid * bid + sg.sz * sg.sz - az * az);
       if (M.lid && !s.pen) { szi = Math.min(szi, M.zi / 3); dh = Math.min(dh, Math.max(M.zi - s.hsE - 1.6 * szi, 0)); }   // 逆溫層：煙流被壓在混合層頂以下
       row.push({x, dh, syi, szi, ay, az, f: Math.min(fK / (syi * szi), 1)});
     }
     return {s, fK, row};
   });
   rows.forEach((r, i) => r.row.forEach((e, j) => { const o = (i * 512 + j) * 4; data[o] = f16(e.dh); data[o + 1] = f16(e.syi); data[o + 2] = f16(e.szi); data[o + 3] = f16(e.ay); }));
+  rows[0].row.forEach((e, j) => { const o = (3 * 512 + j) * 4; data[o] = f16(e.ay); data[o + 1] = f16(e.az); });   // 第 4 列：蜿蜒振幅（和煙囪無關）
   device.queue.writeTexture({texture: PLUME.lutTex}, data, {bytesPerRow: 512 * 8}, [512, 4]);
   // 白煙（凝結水氣）可見長度：中心線混合比例（含湍流峰值約 1.6 倍）降到臨界值的距離
   const main = rows[1].row;
   let xe = 0; for (const e of main) if (e.f * 1.6 >= cond.fcrit) xe = e.x;
   PLUME.xEvap = xe;
-  let xd = 600; for (const e of main) if (Math.min(e.f, 0.03) * hazeK > 3e-6) xd = e.x;
-  const xDraw = PLUME.xDraw = clamp(xd, 600, 9000);
+  // 霾畫到多遠：中心線的霾消光係數降到 4e-6 /m 為止（再遠就看不出來），最多 5 km；著色器會在最後 40% 淡出
+  let xd = 600; for (const e of main) if (hazeK * e.f / (1 + e.f / 0.006) > 4e-6) xd = e.x;
+  const xDraw = PLUME.xDraw = clamp(xd, 600, 5000);
   const e5 = main.find(e => e.x >= 500) || main[511];
   const us = M.src.reduce((a, s) => a + s.us, 0) / M.src.length;
   // 外框（煙流座標）與「濃密段」的取樣點（給光學深度體積定範圍）
@@ -3547,7 +3632,7 @@ function updateFrameUniforms() {
     .set('camPos', [...c.pos, CAM.near]).set('camRight', [...CAM.right, th * aspect]).set('camUp', [...CAM.up, th])
     .set('camFwd', [...CAM.fwd, S.exposure]).set('viewport', [RT.w, RT.h, 1 / RT.w, 1 / RT.h])
     .set('sunDir', [...SUN.dir, SUN.el]).set('sunIllum', [...SUN.illum, SUN.night])
-    .set('time', [S.simTime, S.frame, S.modeK, 0]);
+    .set('time', [S.simTime, S.frame, S.modeK, S.dbgVol || 0]);
   updateShadows();
   UFrame.upload();
   // 鏡射相機（對 y=0 的水面）：其餘欄位和主相機相同
