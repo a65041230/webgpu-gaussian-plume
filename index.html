@@ -32,6 +32,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <title>海港夕煙</title>
+<link rel="icon" href="data:,">
 <style>
 /* §CSS ─────────────────────────────────────────────────────────────── */
 :root{
@@ -56,6 +57,72 @@ html,body{margin:0;height:100%;overflow:hidden;background:#07080b;color:var(--in
 #stat{position:fixed;right:10px;bottom:8px;z-index:20;font:11px/1.4 ui-monospace,Consolas,monospace;color:var(--ink-dim);
   text-align:right;pointer-events:none;text-shadow:0 1px 2px #000}
 #stat[hidden]{display:none}
+/* 介面：半透明深色玻璃面板，文字用暖白，強調色是夕陽的琥珀色 */
+#ui{position:fixed;inset:0;pointer-events:none;z-index:10;font-size:13px;line-height:1.45;transition:opacity .4s}
+#ui.photo{opacity:0}
+#ui>*{pointer-events:auto}
+.glass{background:var(--glass);border:1px solid var(--line);border-radius:10px;-webkit-backdrop-filter:blur(14px) saturate(1.2);backdrop-filter:blur(14px) saturate(1.2)}
+#brand{position:absolute;left:max(18px,env(safe-area-inset-left));top:max(14px,env(safe-area-inset-top));pointer-events:none;text-shadow:0 1px 10px rgba(0,0,0,.55)}
+#brand h1{margin:0;font-size:21px;font-weight:600;letter-spacing:.34em}
+#brand p{margin:3px 0 0;font-size:11px;letter-spacing:.2em;color:var(--ink-dim)}
+#bar{position:absolute;right:max(14px,env(safe-area-inset-right));top:max(12px,env(safe-area-inset-top));display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+button,select{font:inherit;color:var(--ink)}
+.btn{background:var(--glass);border:1px solid var(--line);border-radius:8px;padding:7px 13px;cursor:pointer;-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);letter-spacing:.08em}
+.btn:hover{border-color:rgba(240,178,92,.5)}
+.btn[aria-pressed="true"]{background:rgba(240,178,92,.2);border-color:var(--amber);color:#ffe2b3}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+.seg{display:flex;border-radius:8px;overflow:hidden;border:1px solid var(--line)}
+.seg .btn{border:0;border-radius:0;border-right:1px solid var(--line)}
+.seg .btn:last-child{border-right:0}
+#panel{position:absolute;right:max(14px,env(safe-area-inset-right));top:58px;bottom:14px;width:316px;max-width:calc(100vw - 28px);overflow:auto;padding:4px 14px 14px;scrollbar-width:thin}
+#panel[hidden],#legend[hidden],#joy[hidden],#lift[hidden],#readout[hidden]{display:none}
+#panel h2{font-size:11px;font-weight:600;letter-spacing:.3em;color:var(--amber);margin:14px 0 6px;padding-bottom:4px;border-bottom:1px solid var(--line)}
+.row{display:grid;grid-template-columns:1fr auto;gap:2px 8px;align-items:center;margin:7px 0}
+.row label,.row .lab{color:var(--ink)}
+.row output{font-variant-numeric:tabular-nums;color:var(--amber);white-space:nowrap}
+.row input[type=range]{grid-column:1/3;width:100%;accent-color:var(--amber);height:22px;margin:0}
+.row select{grid-column:1/3;background:rgba(0,0,0,.35);border:1px solid var(--line);border-radius:6px;padding:5px}
+.opts{grid-column:1/3;display:flex;gap:4px;flex-wrap:wrap}
+.opts label{flex:1;text-align:center;border:1px solid var(--line);border-radius:6px;padding:4px 2px;cursor:pointer;position:relative;min-width:34px}
+.opts input{position:absolute;opacity:0;inset:0;margin:0;cursor:pointer}
+.opts label:has(input:checked){background:rgba(240,178,92,.2);border-color:var(--amber);color:#ffe2b3}
+.opts label:has(input:focus-visible){outline:2px solid var(--amber);outline-offset:2px}
+.chk{display:flex;gap:8px;align-items:center;margin:8px 0}
+.chk input{accent-color:var(--amber);width:16px;height:16px}
+#derived{display:grid;grid-template-columns:1fr auto;gap:3px 10px;font-variant-numeric:tabular-nums}
+#derived dt{color:var(--ink-dim)}#derived dd{margin:0;text-align:right}
+.note{color:var(--ink-dim);font-size:11.5px;margin:8px 0 0}
+.warn{color:#ffb89a}
+#legend{z-index:2;position:absolute;left:50%;transform:translateX(-50%);bottom:max(14px,env(safe-area-inset-bottom));padding:9px 14px 8px;width:min(560px,calc(100vw - 28px));text-align:center}
+#legend .barwrap{position:relative;height:12px;border-radius:3px;margin:2px 0 16px}
+#legend .tick{position:absolute;top:13px;transform:translateX(-50%);font-size:10.5px;color:var(--ink-dim);font-variant-numeric:tabular-nums;white-space:nowrap}
+#legend .cap{font-size:11.5px}
+#legend .dis{font-size:10.5px;color:var(--ink-dim);margin-top:2px}
+#labels{position:absolute;inset:0;overflow:hidden;pointer-events:none!important}
+.tag{position:absolute;left:0;top:0;transform:translate(-50%,-100%);padding:3px 7px;border-radius:6px;background:rgba(10,12,16,.72);border:1px solid rgba(120,200,255,.45);font-size:11.5px;white-space:nowrap;font-variant-numeric:tabular-nums;will-change:transform}
+.tag b{color:#9fe0ff;font-weight:600}.tag.max{border-color:#fff}.tag.max b{color:#fff}.tag.ev{border-color:rgba(255,215,130,.7)}.tag.ev b{color:#ffd98a}
+#compass{position:absolute;left:max(16px,env(safe-area-inset-left));top:74px;display:flex;align-items:center;gap:9px;padding:6px 11px 6px 7px;font-variant-numeric:tabular-nums}
+#compass svg{width:40px;height:40px;flex:none}
+#timebox{position:absolute;left:max(16px,env(safe-area-inset-left));bottom:max(14px,env(safe-area-inset-bottom));padding:7px 12px;width:250px}
+#timebox .row{margin:0}
+#hint{position:absolute;left:50%;bottom:86px;transform:translateX(-50%);padding:9px 16px;transition:opacity 1.2s;white-space:nowrap;max-width:calc(100vw - 24px);overflow:hidden;text-overflow:ellipsis}
+#hint.off{opacity:0;pointer-events:none}
+#notice{position:absolute;left:50%;top:60px;transform:translateX(-50%);max-width:min(620px,calc(100vw - 28px));text-align:center;pointer-events:none!important}
+#notice div{display:inline-block;margin:3px;padding:5px 11px;border-radius:7px;background:rgba(60,24,10,.78);border:1px solid rgba(255,160,110,.5);color:#ffd9c4;font-size:12px}
+#joy{position:absolute;left:max(22px,env(safe-area-inset-left));bottom:max(86px,calc(env(safe-area-inset-bottom) + 70px));width:120px;height:120px;border-radius:50%;background:rgba(13,15,20,.35);border:1px solid var(--line);touch-action:none}
+#joy i{position:absolute;left:50%;top:50%;width:48px;height:48px;margin:-24px;border-radius:50%;background:rgba(240,178,92,.45);border:1px solid var(--amber)}
+#lift{position:absolute;right:max(18px,env(safe-area-inset-right));bottom:max(86px,calc(env(safe-area-inset-bottom) + 70px));display:flex;flex-direction:column;gap:10px}
+#lift .btn{width:54px;height:54px;border-radius:50%;padding:0;font-size:18px;touch-action:none}
+@media (max-width:700px){
+  #brand h1{font-size:17px}#brand p{display:none}
+  #panel{top:auto;left:8px;right:8px;bottom:8px;width:auto;max-height:56vh}
+  #compass{top:52px;padding:4px 9px 4px 5px}#compass svg{width:32px;height:32px}
+  #timebox{left:8px;right:8px;width:auto;bottom:max(10px,env(safe-area-inset-bottom))}
+  #legend{bottom:max(64px,calc(env(safe-area-inset-bottom) + 58px))}
+  #hint{bottom:210px;white-space:normal;text-align:center}
+  .btn{padding:7px 10px}
+}
+@media (prefers-reduced-motion:reduce){#ui,#hint{transition:none}}
 </style>
 </head>
 <body>
@@ -71,6 +138,36 @@ html,body{margin:0;height:100%;overflow:hidden;background:#07080b;color:var(--in
 </div>
 <div id="dbg" hidden></div>
 <div id="stat" hidden></div>
+<div id="ui">
+  <header id="brand"><h1>海港夕煙</h1><p>臨海工業區 · 煙流擴散示意</p></header>
+  <div id="bar">
+    <div class="seg" role="group" aria-label="模式">
+      <button class="btn" id="bScene" type="button" aria-pressed="true">景觀</button>
+      <button class="btn" id="bAnalysis" type="button" aria-pressed="false">擴散分析</button>
+    </div>
+    <button class="btn" id="bTop" type="button" hidden>俯視全區</button>
+    <button class="btn" id="bTour" type="button" aria-pressed="false">導覽</button>
+    <button class="btn" id="bPhoto" type="button" title="隱藏介面（按 P 或點畫面恢復）">拍照</button>
+    <button class="btn" id="bPanel" type="button" aria-expanded="false" aria-controls="panel">參數</button>
+  </div>
+  <div id="compass" class="glass" aria-live="off">
+    <svg viewBox="-20 -20 40 40" aria-hidden="true"><circle r="17" fill="none" stroke="rgba(255,255,255,.28)"/><text y="-9.5" text-anchor="middle" font-size="7" fill="#a9a396">北</text>
+      <g id="windArrow"><path d="M0 11 L0 -7" stroke="#f0b25c" stroke-width="2.2" stroke-linecap="round"/><path d="M-4.5 -4 L0 -11 L4.5 -4 Z" fill="#f0b25c"/></g></svg>
+    <span id="windText"></span>
+  </div>
+  <aside id="panel" class="glass" hidden aria-label="參數面板"></aside>
+  <div id="timebox" class="glass"></div>
+  <div id="legend" class="glass" hidden>
+    <div class="cap">地面濃度（μg/m³，對數色階）　<span style="color:#ff8f6b">━</span> 門檻線（示意值）　<span style="color:#ffd98a">┆</span> 白煙蒸發處</div>
+    <div class="barwrap" id="legendBar"></div>
+    <div class="dis">示意模型：穩態高斯煙流（Briggs 擴散係數與浮升），不能取代正式空品模式（如 AERMOD）。白色的是凝結水氣；污染物本身看不見，蒸發後仍繼續擴散。</div>
+  </div>
+  <div id="labels"></div>
+  <div id="notice" role="status" aria-live="polite"></div>
+  <div id="hint" class="glass"></div>
+  <div id="joy" hidden aria-label="移動搖桿"><i></i></div>
+  <div id="lift" hidden><button class="btn" id="bUp" type="button" aria-label="上升">▲</button><button class="btn" id="bDown" type="button" aria-label="下降">▼</button></div>
+</div>
 <!-- @@UI-END -->
 
 <!-- §WGSL ─────────────────────────────────────────────────────────── -->
@@ -125,10 +222,23 @@ struct PlumeU {
   glow: vec4f,             // rgb＝夜間廠區燈光往上照的顏色（照亮煙流底部），w 預留
 };
 @group(0) @binding(6) var<uniform> PL: PlumeU;
+// 擴散模型（分析模式）參數：由 JS 的物理模組算好。WGSL 這邊用 f32 重算濃度，?selftest=1 會和 JS（double）比對
+struct HeatU {
+  src: array<vec4f, 3>,    // x, z（世界座標）、下洗修正後的煙囪高度、煙囪口風速
+  rise: array<vec4f, 3>,   // 過渡段浮升 Δh(x)=min(K·x^e, ΔhF) 的 K、e、ΔhF；w＝排放量 [μg/s]（穿透逆溫層時為 0）
+  sig: vec4f,              // σy = a·x·(1+b·x)^(-1/2)，σz = c·x·(1+d·x)^e 的 a、b、c、d
+  prm: vec4f,              // x＝σz 的指數 e，y＝混合層高度（0＝無），zw＝下風方向 (x,z)
+  grid: vec4f,             // x＝熱圖半寬 [m]，yz＝中心（世界 x,z），w＝門檻濃度 [μg/m³]
+  scale: vec4f,            // x,y＝色階下限、上限的 log10(μg/m³)，z＝白煙蒸發的下風距離 [m]，w＝剖面高度 [m]
+  mark: vec4f,             // xy＝最大落地濃度位置（世界 x,z），z＝Cmax [μg/m³]，w 預留
+  stn: array<vec4f, 6>,    // 虛擬測站位置（世界 x,z）
+};
+@group(0) @binding(7) var<uniform> HU: HeatU;
 
 const PI: f32 = 3.14159265358979;
 const TAU: f32 = 6.28318530717959;
 const MAP_HALF: f32 = 12000.0;   // 地形圖涵蓋 ±12 km（要和 JS 的 WORLD.half 一致）
+const LM_HALF: f32 = 6000.0;     // 夜間地面光池貼圖涵蓋 ±6 km
 
 fn saturate(x: f32) -> f32 { return clamp(x, 0.0, 1.0); }
 fn sat3(x: vec3f) -> vec3f { return clamp(x, vec3f(0.0), vec3f(1.0)); }
@@ -446,6 +556,289 @@ fn skyUv(dir: vec3f) -> vec2f {
 @group(1) @binding(6) var normalTex: texture_2d<f32>;
 @group(1) @binding(7) var macroTex: texture_2d<f32>;
 @group(1) @binding(8) var shadowMap: texture_depth_2d_array;
+@group(1) @binding(9) var lightMap: texture_2d<f32>;
+@group(1) @binding(10) var heatTex: texture_2d<f32>; // @unfilterable
+</script>
+
+<script type="text/wgsl" id="phys_fn">
+// ── phys_fn：高斯煙流（f32）。和 JS 的 PHYS.concSrc 是同一套式子：
+//    Briggs σy、σz＋浮升引起的擴散（BID）＋過渡段浮升＋地面反射；有逆溫層時加 ±4 階反射 ──
+fn concSrc(i: i32, x: f32, y: f32, z: f32) -> f32 {
+  if (x <= 1e-3) { return 0.0; }
+  let s = HU.src[i];
+  let r = HU.rise[i];
+  let sy0 = HU.sig.x * x / sqrt(1.0 + HU.sig.y * x);
+  let sz0 = HU.sig.z * x * pow(1.0 + HU.sig.w * x, HU.prm.x);
+  let dh = min(r.x * pow(x, r.y), r.z);
+  let bid = dh / 3.5;
+  let sy = sqrt(sy0 * sy0 + bid * bid);
+  let sz = sqrt(sz0 * sz0 + bid * bid);
+  let Hh = s.z + dh;
+  let ey = exp(-y * y / (2.0 * sy * sy));
+  let zi = HU.prm.y;
+  if (zi > 0.0) {
+    if (sz >= 1.6 * zi) { return r.w / (sqrt(TAU) * sy * s.w * zi) * ey; }      // 垂直方向已混合均勻
+    var V = 0.0;
+    for (var n = -4; n <= 4; n++) {
+      let a = z - Hh + 2.0 * f32(n) * zi;
+      let b = z + Hh + 2.0 * f32(n) * zi;
+      V += exp(-a * a / (2.0 * sz * sz)) + exp(-b * b / (2.0 * sz * sz));
+    }
+    return r.w / (TAU * s.w * sy * sz) * ey * V;
+  }
+  return r.w / (TAU * s.w * sy * sz) * ey * (exp(-(z - Hh) * (z - Hh) / (2.0 * sz * sz)) + exp(-(z + Hh) * (z + Hh) / (2.0 * sz * sz)));
+}
+// 世界座標 (x,z)、離地高度 h 的總濃度 [μg/m³]（三支煙囪疊加）
+fn concAt(wxz: vec2f, h: f32) -> f32 {
+  let wd = HU.prm.zw;
+  var c = 0.0;
+  for (var i = 0; i < 3; i++) {
+    let rel = wxz - HU.src[i].xy;
+    c += concSrc(i, dot(rel, wd), rel.y * wd.x - rel.x * wd.y, h);
+  }
+  return c;
+}
+</script>
+
+<script type="text/wgsl" id="heat_compute">
+// ── heat_compute：地面濃度熱圖（compute，r32float，單位 μg/m³）──
+#include common
+#include phys_fn
+@group(1) @binding(0) var heatOut: texture_storage_2d<r32float, write>;
+@compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3u) {
+  let dim = textureDimensions(heatOut);
+  if (id.x >= dim.x || id.y >= dim.y) { return; }
+  let uv = (vec2f(id.xy) + 0.5) / vec2f(dim);
+  let wxz = HU.grid.yz + (uv - 0.5) * (2.0 * HU.grid.x);
+  textureStore(heatOut, vec2i(id.xy), vec4f(concAt(wxz, 0.0), 0.0, 0.0, 1.0));
+}
+</script>
+
+<script type="text/wgsl" id="heat_fn">
+// ── heat_fn：把濃度畫成熱圖（viridis 色階、1-2-5 等值線、門檻線、測站與 Cmax 標記）。需要 scene_tex ──
+fn viridis(t: f32) -> vec3f {   // 感知均勻色階（多項式近似）
+  let c0 = vec3f(0.2777273272234177, 0.005407344544966578, 0.3340998053353061);
+  let c1 = vec3f(0.1050930431085774, 1.404613529898575, 1.384590162594685);
+  let c2 = vec3f(-0.3308618287255563, 0.214847559468213, 0.09509516302823659);
+  let c3 = vec3f(-4.634230498983486, -5.799100973351585, -19.33244095627987);
+  let c4 = vec3f(6.228269936347081, 14.17993336680509, 56.69055260068105);
+  let c5 = vec3f(4.776384997670288, -13.74514537774601, -65.35303263337234);
+  let c6 = vec3f(-5.435455855934631, 4.645852612178535, 26.3124352495832);
+  return c0 + t * (c1 + t * (c2 + t * (c3 + t * (c4 + t * (c5 + t * c6)))));
+}
+fn heatLoad(wxz: vec2f) -> f32 {   // 熱圖的雙線性取樣（r32float 要手動內插）；範圍外回傳 -1
+  let uv = (wxz - HU.grid.yz) / (2.0 * HU.grid.x) + 0.5;
+  if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) { return -1.0; }
+  let dim = vec2i(textureDimensions(heatTex));
+  let t = uv * vec2f(dim) - 0.5;
+  let fl = floor(t);
+  let i = vec2i(fl);
+  let f = t - fl;
+  let mx = dim - vec2i(1);
+  let a = textureLoad(heatTex, clamp(i, vec2i(0), mx), 0).r;
+  let b = textureLoad(heatTex, clamp(i + vec2i(1, 0), vec2i(0), mx), 0).r;
+  let c = textureLoad(heatTex, clamp(i + vec2i(0, 1), vec2i(0), mx), 0).r;
+  let d = textureLoad(heatTex, clamp(i + vec2i(1, 1), vec2i(0), mx), 0).r;
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+// 濃度 → (顏色, 不透明度)。lc＝log10(濃度)，fw＝lc 在螢幕上一個像素的變化量（畫等值線用）
+fn heatColor(c: f32, lc: f32, fw: f32) -> vec4f {
+  let t = saturate((lc - HU.scale.x) / (HU.scale.y - HU.scale.x));
+  var col = viridis(t);
+  var a = smoothstep(0.0, 0.12, t) * 0.80;
+  // 等值線：每十倍分成 1、2、5 三條
+  let fr = lc - floor(lc);
+  let dl = min(min(abs(fr), abs(fr - 0.30103)), min(abs(fr - 0.69897), abs(fr - 1.0))) / max(fw, 1e-6);
+  let line = (1.0 - smoothstep(0.7, 1.6, dl)) * step(HU.scale.x, lc);
+  col = mix(col, vec3f(0.96), line * 0.55);
+  a = max(a, line * 0.5);
+  // 門檻線（示意值）：較粗的白線
+  let dt = abs(lc - log(HU.grid.w) / 2.302585) / max(fw, 1e-6);
+  let tl = 1.0 - smoothstep(1.6, 3.0, dt);
+  col = mix(col, vec3f(1.0, 0.36, 0.22), tl);
+  a = max(a, tl * 0.95);
+  return vec4f(col, a * step(0.0, c));
+}
+// 貼在地面／水面上的熱圖。base＝原本的顏色；回傳疊上熱圖後的顏色
+fn heatGround(base: vec3f, wxz: vec2f, c: f32, lc: f32, fw: f32, pixM: f32) -> vec3f {
+  var k = F.time.z;
+  if (k < 0.004) { return base; }
+  // 熱圖邊界淡出（避免範圍邊緣出現一刀切的直線）
+  let guv = (wxz - HU.grid.yz) / (2.0 * HU.grid.x) + 0.5;
+  let ge = min(min(guv.x, 1.0 - guv.x), min(guv.y, 1.0 - guv.y));
+  let hc = heatColor(c, lc, fw) * vec4f(1.0, 1.0, 1.0, smoothstep(0.0, 0.05, ge));
+  // 發光量依場景亮度調整（曝光會隨時間改變）
+  let lum = 0.55 / max(F.camFwd.w, 1e-3);
+  var col = mix(base, hc.rgb * lum, hc.a * k);
+  // 下風軸線：每 1 km 一個刻度
+  let rel = wxz - HU.src[1].xy;
+  let wd = HU.prm.zw;
+  let ax = dot(rel, wd);
+  let ay = abs(rel.y * wd.x - rel.x * wd.y);
+  let w = max(pixM * 1.2, 3.0);
+  var m = (1.0 - smoothstep(w, w * 2.0, ay)) * step(0.0, ax) * step(fract(ax / 200.0), 0.6) * 0.7;
+  let tick = abs(fract(ax / 1000.0 + 0.5) - 0.5) * 1000.0;
+  m = max(m, (1.0 - smoothstep(w, w * 2.0, tick)) * step(ay, 90.0) * step(500.0, ax));
+  // Cmax 與測站：圓環
+  let dm = length(wxz - HU.mark.xy);
+  m = max(m, 1.0 - smoothstep(w, w * 2.0, abs(dm - 110.0)));
+  m = max(m, 1.0 - smoothstep(w * 0.5, w * 1.5, abs(dm - 30.0)));
+  var st = 0.0;
+  for (var i = 0; i < 6; i++) {
+    let ds = length(wxz - HU.stn[i].xy);
+    st = max(st, 1.0 - smoothstep(w, w * 2.0, abs(ds - 70.0)));
+    st = max(st, 1.0 - smoothstep(18.0, 26.0 + w, ds));
+  }
+  col = mix(col, vec3f(1.0) * lum, m * k);
+  col = mix(col, vec3f(0.35, 0.85, 1.0) * lum * 1.2, st * k);
+  return col;
+}
+</script>
+
+<script type="text/wgsl" id="curtain">
+// ── curtain：沿下風軸線的垂直剖面（分析模式）。每個像素直接用模型算濃度，
+//    看得出煙流怎麼浮升、何時碰到地面；白煙蒸發的位置用虛線標出，之後只剩看不見的污染物 ──
+#include common
+#include phys_fn
+#include atmo_fn
+#include scene_tex
+#include heat_fn
+struct COut { @builtin(position) pos: vec4f, @location(0) xa: f32, @location(1) h: f32 };
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> COut {
+  let c = vec2f(f32(vi & 1u), f32((vi >> 1u) & 1u));
+  let L = HU.grid.x * 1.3;
+  let xa = c.x * L;
+  let h = c.y * HU.scale.w;
+  let o = HU.src[1].xy + HU.prm.zw * xa;
+  var out: COut;
+  out.pos = F.viewProj * vec4f(o.x, h + 3.2, o.y, 1.0);
+  out.xa = xa; out.h = h;
+  return out;
+}
+@fragment fn fs(in: COut) -> @location(0) vec4f {
+  let k = F.time.z;
+  let wxz = HU.src[1].xy + HU.prm.zw * in.xa;
+  let c = concAt(wxz, in.h);
+  let lc = log(max(c, 1e-9)) / 2.302585;
+  let fw = fwidth(lc);
+  let hc = heatColor(c, lc, fw);
+  let lum = 0.55 / max(F.camFwd.w, 1e-3);
+  var col = hc.rgb;
+  var a = hc.a * 0.9;
+  // 主煙囪的中心線 H(x)
+  let r = HU.rise[1];
+  let Hc = HU.src[1].z + min(r.x * pow(max(in.xa, 1e-3), r.y), r.z);
+  let fh = fwidth(in.h);
+  let cl = 1.0 - smoothstep(fh * 1.0, fh * 2.2, abs(in.h - Hc));
+  col = mix(col, vec3f(1.0), cl); a = max(a, cl * 0.9);
+  // 混合層頂（逆溫層）
+  if (HU.prm.y > 0.0) {
+    let ll = (1.0 - smoothstep(fh, fh * 2.2, abs(in.h - HU.prm.y))) * step(fract(in.xa / 120.0), 0.5);
+    col = mix(col, vec3f(0.5, 0.8, 1.0), ll); a = max(a, ll * 0.9);
+  }
+  // 白煙蒸發的位置
+  let fx = fwidth(in.xa);
+  let ev = (1.0 - smoothstep(fx, fx * 2.2, abs(in.xa - HU.scale.z))) * step(fract(in.h / 60.0), 0.5);
+  col = mix(col, vec3f(1.0, 0.85, 0.5), ev); a = max(a, ev * 0.95);
+  // 外框
+  let edge = 1.0 - smoothstep(fh * 1.0, fh * 2.5, min(in.h, HU.scale.w - in.h));
+  a = max(a, edge * 0.5); col = mix(col, vec3f(0.8), edge);
+  return vec4f(col * lum, a * k);
+}
+</script>
+
+<script type="text/wgsl" id="lights">
+// ── lights：夜間燈光的 sprite（instancing、加色混合）。遠處的燈至少畫 1.6 個像素寬，
+//    同時把輝度依面積調低，總光量不變 → 不閃爍、亮度隨距離平方衰減 ──
+#include common
+struct LIn { @location(0) pos: vec4f, @location(1) col: vec4f };   // pos.w＝光量；col.a＝種類（整數）＋相位（小數）
+struct LOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) col: vec3f };
+@vertex fn vs(@builtin(vertex_index) vi: u32, l: LIn) -> LOut {
+  let c = vec2f(f32(vi & 1u), f32((vi >> 1u) & 1u)) * 2.0 - 1.0;
+  let rel = l.pos.xyz - F.camPos.xyz;
+  let vd = max(dot(rel, F.camFwd.xyz), 0.1);
+  let pix = 2.0 * F.camUp.w * F.viewport.w;
+  let s = max(0.45, vd * pix * 1.6);
+  let kind = i32(floor(l.col.a));
+  let ph = fract(l.col.a);
+  let night = F.sunIllum.w;
+  var on = smoothstep(ph * 0.55, ph * 0.55 + 0.18, night);        // 每盞燈在不同的天色亮起
+  var power = l.pos.w;
+  if (kind == 2) {                                                 // 航空障礙燈：全天亮、慢閃；白天模式較亮
+    on = 0.25 + 0.75 * smoothstep(0.1, 0.9, sin(F.time.x * 1.9 + ph * 40.0) * 0.5 + 0.5);
+    power *= 1.0 + 45.0 * (1.0 - night);
+  }
+  if (kind == 3 || kind == 4) { on *= step(0.55, fract(F.time.x * 0.25 + ph)); }   // 導航燈：明滅
+  var o: LOut;
+  let wp = l.pos.xyz + (F.camRight.xyz * c.x + F.camUp.xyz * c.y) * (s * 2.6);
+  o.pos = F.viewProj * vec4f(wp, 1.0);
+  o.uv = c * 2.6;
+  o.col = l.col.rgb * (power * on / (PI * s * s));
+  return o;
+}
+@fragment fn fs(in: LOut) -> @location(0) vec4f {
+  return vec4f(in.col * exp(-dot(in.uv, in.uv)), 0.0);
+}
+</script>
+
+<script type="text/wgsl" id="lightmap_gen">
+// ── lightmap_gen：啟動時把每盞燈在地面的光池畫進一張俯視貼圖（±LM_HALF 公尺）──
+#include common
+struct LIn { @location(0) pos: vec4f, @location(1) col: vec4f };
+struct LOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) col: vec3f, @location(2) h: f32 };
+@vertex fn vs(@builtin(vertex_index) vi: u32, l: LIn) -> LOut {
+  let c = vec2f(f32(vi & 1u), f32((vi >> 1u) & 1u)) * 2.0 - 1.0;
+  let kind = i32(floor(l.col.a));
+  let h = clamp(l.pos.y - 3.0, 6.0, 60.0);
+  let r = h * 5.0;
+  var o: LOut;
+  let xz = l.pos.xz + c * r;
+  o.pos = vec4f(xz.x / LM_HALF, -xz.y / LM_HALF, 0.0, 1.0);
+  o.uv = c * 5.0;
+  o.h = h;
+  o.col = l.col.rgb * l.pos.w * step(f32(kind), 1.5);      // 只有路燈、工作燈（種類 0、1）會照亮地面
+  return o;
+}
+@fragment fn fs(in: LOut) -> @location(0) vec4f {
+  // 點光源在地面的照度：∝ h / (h² + r²)^1.5
+  let r2 = dot(in.uv, in.uv);
+  let e = 1.0 / (in.h * in.h * pow(1.0 + r2, 1.5)) * smoothstep(25.0, 9.0, r2);
+  return vec4f(in.col * e, 0.0);
+}
+</script>
+
+<script type="text/wgsl" id="flame">
+// ── flame：火炬塔的火焰（一片面向相機的四邊形，形狀與顏色由雜訊程序生成，會被風吹斜）──
+#include common
+@group(1) @binding(0) var noise2D: texture_2d<f32>;
+struct FOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> FOut {
+  let c = vec2f(f32(vi & 1u), f32((vi >> 1u) & 1u));
+  let base = PL.flare.xyz - vec3f(0.0, 6.0, 0.0);
+  let side = normalize(vec3f(F.camRight.x, 0.0, F.camRight.z));
+  let lean = vec3f(PL.wind.x, 0.0, PL.wind.y) * (c.y * c.y) * 16.0;       // 火焰往下風倒
+  let wp = base + side * ((c.x - 0.5) * 16.0) + vec3f(0.0, c.y * 34.0, 0.0) + lean;
+  var o: FOut;
+  o.pos = F.viewProj * vec4f(wp, 1.0);
+  o.uv = c;
+  return o;
+}
+@fragment fn fs(in: FOut) -> @location(0) vec4f {
+  let t = F.time.x;
+  let x = in.uv.x * 2.0 - 1.0;
+  let y = in.uv.y;
+  let n1 = textureSampleLevel(noise2D, sRep, vec2f(x * 0.22 + 0.3, y * 0.35 - t * 0.55), 0.0).r;
+  let n2 = textureSampleLevel(noise2D, sRep, vec2f(x * 0.6 + 0.7, y * 0.9 - t * 1.3), 0.0).g;
+  let wob = (n1 - 0.5) * 0.9 * y + (n2 - 0.5) * 0.35;
+  let w = mix(0.16, 0.50, smoothstep(0.0, 0.25, y)) * (1.0 - smoothstep(0.35, 1.0, y));   // 水滴形的輪廓
+  let d = abs(x + wob) / max(w, 1e-3);
+  var v = saturate(1.0 - d) * smoothstep(0.0, 0.04, y);
+  v *= 0.55 + 0.9 * n2;
+  v = saturate(v * 1.6 - y * 0.55);
+  // 黑體色階：紅 → 橘 → 黃白
+  let col = vec3f(1.0, 0.33, 0.07) * v + vec3f(1.0, 0.75, 0.35) * pow(v, 2.5) * 1.6 + vec3f(0.9, 0.9, 0.8) * pow(v, 6.0) * 2.0;
+  return vec4f(col * PL.flare.w * 0.012, 0.0);
+}
 </script>
 
 <script type="text/wgsl" id="noise3d_gen">
@@ -862,6 +1255,16 @@ fn shade(s: Surf, V: vec3f) -> vec3f {
   if (nl > 0.0) { col = (diff + D * Vis * Fr) * F.sunIllum.rgb * nl * sunShadow(s.pos, s.n); }
   col += s.albedo * (1.0 - s.metal) * ambient(s.n) * s.ao;
   col += F0 * ambient(reflect(-V, s.n)) * s.metal * s.ao * (1.0 - 0.5 * s.rough);
+  // 夜間：燈光在地面的光池（俯視貼圖）＋火炬的點光源
+  let night = F.sunIllum.w;
+  if (night > 0.01) {
+    let lm = textureSampleLevel(lightMap, sLin, s.pos.xz / (2.0 * LM_HALF) + 0.5, 0.0).rgb;
+    let hAbove = max(s.pos.y - 3.2, 0.0);
+    col += s.albedo * lm * smoothstep(0.05, 0.6, night) * (0.35 + 0.65 * saturate(s.n.y)) / (1.0 + hAbove * hAbove / 500.0);
+  }
+  let fv = PL.flare.xyz - s.pos;
+  let fd2 = dot(fv, fv);
+  col += s.albedo * vec3f(1.0, 0.52, 0.20) * (PL.flare.w / (fd2 + 100.0)) * saturate(dot(s.n, fv) / sqrt(fd2) * 0.7 + 0.3) / PI;
   return col + s.emis;
 }
 </script>
@@ -876,6 +1279,7 @@ fn shade(s: Surf, V: vec3f) -> vec3f {
 #include sky_fn
 #include terrain_fn
 #include lighting
+#include heat_fn
 struct TerrainU {
   levels: array<vec4f, 10>,   // xy＝中心 xz（已對齊格點），z＝格距（m），w＝高度圖 mip
   inner: array<vec4f, 10>,    // 細一層涵蓋的範圍 xmin, zmin, xmax, zmax（這個範圍內不畫）
@@ -906,10 +1310,17 @@ struct VOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f, @location(1
   let nz2 = textureSample(noise2D, sRep, in.wp.xz / 61.0);
   let dn1 = textureSample(noise2D, sRep, in.wp.xz / 128.0).rg - 0.5;
   let dn2 = textureSample(noise2D, sRep, in.wp.xz / 13.0).gr - 0.5;
+  // 分析模式的熱圖：濃度與它在螢幕上的變化率要在任何分支之前算好
+  let hcv = heatLoad(in.wp.xz);
+  let hlc = log(max(hcv, 1e-9)) / 2.302585;
+  let hfw = fwidth(hlc);
   if (in.lvl > 0u) {
     let r = T.inner[in.lvl];
     if (in.wp.x > r.x && in.wp.z > r.y && in.wp.x < r.z && in.wp.z < r.w) { discard; }
   }
+#if REFL
+  if (in.wp.y < 0.0) { discard; }   // 倒影 pass：水面以下不畫
+#endif
   let mac = textureSampleLevel(macroTex, sLin, uv, 0.0);
   var n = normalize(nt.xyz * 2.0 - 1.0);
   let slope = 1.0 - n.y;
@@ -932,7 +1343,10 @@ struct VOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f, @location(1
   n = normalize(n + vec3f(dn1.x, 0.0, dn1.y) * (0.06 + 1.0 * rough) + vec3f(dn2.x, 0.0, dn2.y) * (0.05 + 0.3 * rough));
   var s: Surf;
   s.pos = in.wp; s.n = n; s.albedo = alb; s.rough = 0.92; s.metal = 0.0; s.ao = 1.0; s.emis = vec3f(0.0);
-  return vec4f(shade(s, normalize(F.camPos.xyz - in.wp)), 1.0);
+  let toCam = F.camPos.xyz - in.wp;
+  var col = shade(s, normalize(toCam));
+  col = heatGround(col, in.wp.xz, hcv, hlc, hfw, length(toCam) * 2.0 * F.camUp.w * F.viewport.w);
+  return vec4f(col, 1.0);
 }
 </script>
 
@@ -947,6 +1361,8 @@ struct VOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f, @location(1
 #include sky_fn
 #include terrain_fn
 #include lighting
+#include heat_fn
+@group(2) @binding(0) var reflTex: texture_2d<f32>;   // 平面反射（鏡射相機畫的設施、地形、燈光）
 struct WOut { @builtin(position) pos: vec4f };
 @vertex fn vs(@builtin(vertex_index) i: u32) -> WOut {
   let c = vec2f(f32(i & 1u), f32((i >> 1u) & 1u)) * 2.0 - 1.0;
@@ -1009,7 +1425,17 @@ fn wave(p: vec2f, t: f32, ang: f32, lam: f32, steep: f32, ph: f32, foot: vec2f, 
   var R = reflect(rd, N);
   R.y = abs(R.y) + alpha * 0.35;
   R = normalize(R);
-  let refl = skyColor(R, 0.0);
+  // 平面反射：用波浪斜率偏移取樣位置，並沿垂直方向多取幾點（水面越粗糙拉得越長）→ 燈光與煙囪的倒影拖成長條
+  let du = dot(slope, F.camRight.xz) / F.camRight.w * 0.5;
+  let dv = dot(slope, vdir) / F.camUp.w * 0.9;
+  let spread = (alpha * 0.55 + 0.002) / F.camUp.w;
+  var pr = vec4f(0.0);
+  for (var k = 0; k < 5; k++) {
+    let o = (f32(k) - 2.0) * 0.5;
+    pr += textureSampleLevel(reflTex, sLin, clamp(uv + vec2f(du, dv + o * spread), vec2f(0.001), vec2f(0.999)), 0.0);
+  }
+  pr *= 0.2;
+  let refl = skyColor(R, 0.0) * (1.0 - pr.a) + pr.rgb;
   // 太陽高光（GGX；粗糙度來自斜率變異數）
   let L = F.sunDir.xyz;
   let H = normalize(L + V);
@@ -1035,6 +1461,9 @@ fn wave(p: vec2f, t: f32, ang: f32, lam: f32, steep: f32, ph: f32, foot: vec2f, 
   let foam = smoothstep(-0.9, -0.05, hh + (fn_ - 0.6) * 0.8) * (0.3 + 0.7 * sea);
   var col = mix(body, refl, fres) + spec;
   col = mix(col, vec3f(0.55) * Edown / PI, foam * 0.75);
+  let hcv = heatLoad(p.xz);
+  let hlc = log(max(hcv, 1e-9)) / 2.302585;
+  col = heatGround(col, p.xz, hcv, hlc, fwidth(hlc), t * pix);
   return vec4f(col, 1.0);
 }
 </script>
@@ -1219,6 +1648,9 @@ fn palette(h: f32) -> vec3f {                    // 貨櫃常見顏色
   // 接近地面的積塵與濺痕
   alb *= mix(0.78, 1.0, smoothstep(0.0, 1.6, in.wp.y - terrainH(in.wp.xz, 1) + n2.b));
   s.n = n; s.albedo = alb;
+#if REFL
+  if (in.wp.y < 0.0) { discard; }   // 倒影 pass：水面以下不畫
+#endif
   return vec4f(shade(s, normalize(F.camPos.xyz - in.wp)), 1.0);
 }
 </script>
@@ -1499,6 +1931,35 @@ fn kw(c: vec3f) -> f32 { return 1.0 / (1.0 + luma(c)); }
 }
 </script>
 
+<script type="text/wgsl" id="fxaa">
+// ── fxaa：沒有 MSAA 的畫質等級用的後處理反鋸齒（FXAA，Timothy Lottes 的精簡版）＋ dithering ──
+#include common
+#include fullscreen
+@group(1) @binding(0) var ldrTex: texture_2d<f32>;
+fn tp(uv: vec2f) -> vec3f { return textureSampleLevel(ldrTex, sLin, uv, 0.0).rgb; }
+@fragment fn fs(in: FSOut) -> @location(0) vec4f {
+  let ts = 1.0 / vec2f(textureDimensions(ldrTex));
+  let uv = in.uv;
+  let m = tp(uv);
+  let lNW = luma(tp(uv + ts * vec2f(-1.0, -1.0))); let lNE = luma(tp(uv + ts * vec2f(1.0, -1.0)));
+  let lSW = luma(tp(uv + ts * vec2f(-1.0, 1.0)));  let lSE = luma(tp(uv + ts * vec2f(1.0, 1.0)));
+  let lM = luma(m);
+  let lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+  let lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+  var dir = vec2f(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));
+  let red = max((lNW + lNE + lSW + lSE) * 0.03125, 1.0 / 128.0);
+  dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + red), vec2f(-8.0), vec2f(8.0)) * ts;
+  let a = 0.5 * (tp(uv + dir * (1.0 / 3.0 - 0.5)) + tp(uv + dir * (2.0 / 3.0 - 0.5)));
+  let b = a * 0.5 + 0.25 * (tp(uv - dir * 0.5) + tp(uv + dir * 0.5));
+  let lB = luma(b);
+  var o = b;
+  if (lB < lMin || lB > lMax) { o = a; }
+  let n1 = hash21(in.pos.xy + vec2f(F.time.y * 13.0, 7.0));
+  let n2 = hash21(in.pos.xy + vec2f(91.0, F.time.y * 17.0 + 3.0));
+  return vec4f(o + (n1 + n2 - 1.0) / 255.0, 1.0);
+}
+</script>
+
 <script type="text/wgsl" id="post_final">
 // ── post_final：曝光 → AgX → 調色 → dithering → canvas ──
 #include common
@@ -1554,10 +2015,12 @@ fn toSrgb(c: vec3f) -> vec3f {
   // 分析模式：去飽和
   o = mix(o, vec3f(luma(o)), P.p0.z);
   o = toSrgb(o);
-  // 三角分佈 dithering，消除 8-bit 色帶
+#if !TO_LDR
+  // 三角分佈 dithering，消除 8-bit 色帶（走 FXAA 的等級改在 FXAA 之後做）
   let n1 = hash21(in.pos.xy + vec2f(P.p1.z * 13.0, 7.0));
   let n2 = hash21(in.pos.xy + vec2f(91.0, P.p1.z * 17.0 + 3.0));
   o += (n1 + n2 - 1.0) / 255.0;
+#endif
   return vec4f(o, 1.0);
 }
 </script>
@@ -1835,7 +2298,7 @@ const PHYS = (() => {
 // ═══ §J3 GPU 基礎建設 ═════════════════════════════════════════════════
 let adapter = null, device = null, context = null, presentFormat = 'bgra8unorm';
 const canvas = $('#gfx');
-const GPU = {ready: false, gen: 0, bglCache: new Map(), pipelines: {}, adapterName: '', glName: '', features: [], software: false, lostCount: 0};
+const GPU = {ready: false, gen: 0, bglCache: new Map(), pipelines: {}, adapterName: '', glName: '', features: [], software: false, lostCount: 0, tex: [], buf: []};
 const RES = {};   // 依名稱登記的 GPU 資源（bind group 依 WGSL 變數名稱來這裡找）
 const RT = {};    // render targets
 
@@ -2058,6 +2521,10 @@ async function initGPU() {
   GPU.software = !!(info.isFallbackAdapter || adapter.isFallbackAdapter) || /swiftshader|llvmpipe|software|basic render|warp/i.test(GPU.adapterName + ' ' + GPU.glName);
   GPU.features = ['timestamp-query', 'float32-filterable', 'shader-f16'].filter(f => adapter.features.has(f));
   device = await adapter.requestDevice({requiredFeatures: GPU.features});   // 只用預設 limits
+  // 記下建立過的貼圖與 buffer，重建時（切換畫質）才能一次釋放
+  const ct = device.createTexture.bind(device), cb = device.createBuffer.bind(device);
+  device.createTexture = (d) => { const t = ct(d); GPU.tex.push(t); return t; };
+  device.createBuffer = (d) => { const b = cb(d); GPU.buf.push(b); return b; };
   device.onuncapturederror = (e) => reportError('[WebGPU] ' + (e.error && e.error.message || e.error));
   const dev = device;
   device.lost.then((info) => {
@@ -2074,6 +2541,7 @@ async function initGPU() {
 
 // ═══ §J4 render target 與共用資源 ═════════════════════════════════════
 function pickTier() {
+  if (S.forceTier && TIERS[S.forceTier]) return TIERS[S.forceTier];
   if (CFG.q && TIERS[CFG.q]) return TIERS[CFG.q];
   if (CFG.shot) return TIERS.high;
   const ua = navigator.userAgent, name = (GPU.adapterName + ' ' + GPU.glName).toLowerCase();
@@ -2108,6 +2576,14 @@ function allocTargets() {
   RT.volHist = [mkTex('volHist0', vw, vh, 'rgba16float', RU), mkTex('volHist1', vw, vh, 'rgba16float', RU)];
   RT.histIdx = 0; S.volReset = true;
   RES.depthIn = RT.depth.view; RES.curTex = RT.volCur.view; RES.auxTex = RT.volAux.view;
+  if (RT.ldr) { RT.ldr.destroy(); RT.ldr = null; }
+  if (TIER.msaa === 1) { RT.ldr = mkTex('ldr', w, h, 'rgba8unorm', RU); RES.ldrTex = RT.ldr.view; }
+  // 水面的平面反射
+  for (const k of ['refl', 'reflDepth']) if (RT[k]) RT[k].destroy();
+  RT.rw = Math.max(4, Math.ceil(w / TIER.reflDiv)); RT.rh = Math.max(4, Math.ceil(h / TIER.reflDiv));
+  RT.refl = mkTex('refl', RT.rw, RT.rh, 'rgba16float', RU);
+  RT.reflDepth = mkTex('reflDepth', RT.rw, RT.rh, 'depth32float', U.RENDER_ATTACHMENT);
+  RES.reflTex = RT.refl.view;
   // bloom：每級解析度減半
   if (RT.bloom) RT.bloom.forEach(t => t.destroy());
   RT.bloom = [];
@@ -2199,7 +2675,7 @@ function genNoise2D(size = 512) {
   return {size, mips};
 }
 const LUT = {};
-let UFrame = null, UPost = null, UAtmo = null;
+let UFrame = null, UPost = null, UAtmo = null, UFrameR = null;
 function buildAtmoResources() {
   const U = GPUTextureUsage, RU = U.RENDER_ATTACHMENT | U.TEXTURE_BINDING;
   LUT.trans = mkTex('transLUT', 256, 64, 'rgba16float', RU);
@@ -2231,6 +2707,9 @@ function buildStatic() {
   RES.F = UFrame.buf;
   UPost = new UBO('PostU', 'PostU', WGSL_SRC.post_final);
   RES.P = UPost.buf;
+  UFrameR = new UBO('FrameR', 'Frame', WGSL_SRC.common);   // 倒影 pass 用的鏡射相機
+  UHeat = new UBO('HeatU', 'HeatU', WGSL_SRC.common);
+  RES.HU = UHeat.buf;
   UPlume = new UBO('PlumeU', 'PlumeU', WGSL_SRC.common);   // group 0 的成員，所有 pipeline 都會綁到，所以要最早建立
   RES.PL = UPlume.buf;
   const black = mkTex('black', 1, 1, 'rgba16float', GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST);
@@ -2286,6 +2765,19 @@ function buildPipelines() {
   P.volTemporal = mkRender({label: 'volTemporal', id: 'vol_temporal', targets: HDR});
   P.volComposite = mkRender({label: 'volComposite', id: 'vol_composite', defs: MS, targets: [{format: 'rgba16float',
     blend: {color: {srcFactor: 'one', dstFactor: 'src-alpha', operation: 'add'}, alpha: {srcFactor: 'zero', dstFactor: 'one', operation: 'add'}}}]});
+  const ADDT = [{format: 'rgba16float', blend: {color: {srcFactor: 'one', dstFactor: 'one', operation: 'add'}, alpha: {srcFactor: 'zero', dstFactor: 'one', operation: 'add'}}}];
+  const depthFx = {format: 'depth32float', depthWriteEnabled: false, depthCompare: 'greater-equal'};
+  P.lights = mkRender({label: 'lights', id: 'lights', targets: ADDT, samples: TIER.msaa, depth: depthFx, buffers: LIGHT_BUFFERS, primitive: {topology: 'triangle-strip'}});
+  P.flame = mkRender({label: 'flame', id: 'flame', targets: ADDT, samples: TIER.msaa, depth: depthFx, primitive: {topology: 'triangle-strip'}});
+  // 倒影 pass 的版本（鏡射相機、不用 MSAA、水面以下不畫）
+  const RD = {REFL: true};
+  P.meshR = mkRender({label: 'meshR', id: 'mesh', defs: RD, targets: HDR, depth: depthMain, buffers: MESH_BUFFERS});
+  P.terrainR = mkRender({label: 'terrainR', id: 'terrain', defs: RD, targets: HDR, depth: depthMain, buffers: GRID});
+  P.lightsR = mkRender({label: 'lightsR', id: 'lights', targets: ADDT, depth: depthFx, buffers: LIGHT_BUFFERS, primitive: {topology: 'triangle-strip'}});
+  P.flameR = mkRender({label: 'flameR', id: 'flame', targets: ADDT, depth: depthFx, primitive: {topology: 'triangle-strip'}});
+  P.heat = mkCompute({label: 'heat', id: 'heat_compute'});
+  P.curtain = mkRender({label: 'curtain', id: 'curtain', samples: TIER.msaa, depth: depthFx, primitive: {topology: 'triangle-strip'},
+    targets: [{format: 'rgba16float', blend: {color: {srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add'}, alpha: {srcFactor: 'zero', dstFactor: 'one', operation: 'add'}}}]});
   P.bloomDownK = mkRender({label: 'bloomDownK', id: 'bloom_down', defs: {KARIS: true}, targets: HDR});
   P.bloomDown = mkRender({label: 'bloomDown', id: 'bloom_down', targets: HDR});
   P.bloomUp = mkRender({label: 'bloomUp', id: 'bloom_up', targets: [{format: 'rgba16float', blend: {color: {srcFactor: 'one', dstFactor: 'one', operation: 'add'}, alpha: {srcFactor: 'zero', dstFactor: 'one', operation: 'add'}}}]});
@@ -2298,7 +2790,11 @@ function buildPipelines() {
   P.sky = mkRender({label: 'sky', id: 'sky', targets: HDR, samples: TIER.msaa,
     depth: {format: 'depth32float', depthWriteEnabled: false, depthCompare: 'greater-equal'}});
   if (TIER.msaa > 1) P.resolve = mkRender({label: 'resolve', id: 'resolve', targets: [{format: 'rgba16float'}]});
-  P.final = mkRender({label: 'final', id: 'post_final', targets: [{format: presentFormat}]});
+  if (TIER.msaa > 1) P.final = mkRender({label: 'final', id: 'post_final', targets: [{format: presentFormat}]});
+  else {   // 沒有 MSAA：tone map 到 8-bit 中介貼圖，再做 FXAA 輸出
+    P.final = mkRender({label: 'final', id: 'post_final', defs: {TO_LDR: true}, targets: [{format: 'rgba8unorm'}]});
+    P.fxaa = mkRender({label: 'fxaa', id: 'fxaa', targets: [{format: presentFormat}]});
+  }
 }
 
 // ═══ §J5 場景生成：配置、地形 ════════════════════════════════════════
@@ -2673,9 +3169,19 @@ function buildScene() {
     ub(s.x - 55, bz + 2, 34, 27, 32, 0, [0.46, 0.46, 0.44], 0);
     add('column', m4.TRS(s.x - 24, PL, bz - 6, 0.6, 3.1, 0.86, 3.1), [0.5, 0.5, 0.5], 0);
     ub(s.x - 13, bz, 16, 6.5, 6.5, 0, [0.42, 0.42, 0.41], 5, 15);
-    for (const dz of [-30, 30]) light(bx, 60, bz + dz, 1, 1.2);
     light(bx - 6, 82, bz, 2, 0.8);
+    // 鍋爐房各層平台的工作燈（朝內港那一面與兩側）、煙囪基座的投光燈
+    for (let y = 10; y <= 58; y += 12) for (const dz of [-22, -8, 8, 22]) if (R() < 0.8) light(bx + 32.5, PL + y, bz + dz, R() < 0.75 ? 1 : 0, rr(0.5, 1.0));
+    for (let y = 14; y <= 78; y += 16) for (const s2 of [-1, 1]) { light(bx - 6 + rr(-12, 12), PL + y, bz + s2 * 26.5, 1, 0.6); light(bx - 6 + 18, PL + y, bz + s2 * 10, 0, 0.5); }
+    for (const dz of [-16, 16]) light(s.x - 55 + 18, PL + 29, bz + dz, 0, 0.8);
+    light(s.x + 14, PL + 9, bz + 6, 1, 2.2); light(s.x - 24, PL + 44, bz - 6, 1, 0.8);
   });
+  for (let z = -90; z <= 330; z += 28) { light(-242, PL + 37, z, 1, 0.7); if (R() < 0.6) light(-242, PL + 12, z + 9, 0, 0.8); }
+  for (let z = -580; z <= 960; z += 55) { add('lightPole', m4.TRS(128, PL + 0.4, z, 0), [1.0, 0.62, 0.28], 0); light(129.8, PL + 12.4, z, 0, 1.0); }
+  for (let x = -1150; x <= 60; x += 70) { light(x, PL + 11, -600, 0, 0.9); light(x + 30, PL + 11, 1650, 0, 0.9); }
+  for (let z = -520; z <= 1600; z += 80) light(-1190, PL + 11, z, 0, 0.9);
+  for (let k = 0; k < 3; k++) for (let a = 0; a < 6; a++) light(-820 + Math.cos(a) * 64, PL + 9, 620 + k * 190 + Math.sin(a) * 64, 0, 0.8);
+  for (const z of [500, 640]) { light(134 + 22, PL + 34, z, 1, 2.0); light(134 - 8, PL + 44, z, 1, 1.2); light(134 + 5, PL + 57, z, 2, 0.5); }
   ub(-262, 120, 38, 36, 440, 0, [0.50, 0.50, 0.48], 3);
   ub(-320, 120, 60, 14, 380, 0, [0.44, 0.45, 0.46], 4);
   for (let k = 0; k < 3; k++) { add('dome', m4.TRS(-820, PL, 620 + k * 190, 0, 62, 44, 62), [0.60, 0.60, 0.58], 0); light(-820, 46, 620 + k * 190, 2, 0.6); }
@@ -2801,6 +3307,39 @@ function updateStacks() {
     writeInst(SCENE.data, it.off, it.M, it.c, it.a);
     if (SCENE.buf) device.queue.writeBuffer(SCENE.buf, it.off * 4, SCENE.data, it.off, 16);
   });
+  if (SCENE.lbuf) {   // 障礙燈跟著煙囪高度移動
+    for (let i = SCENE.stackLights; i < SCENE.lights.length; i++) writeLight(i);
+    device.queue.writeBuffer(SCENE.lbuf, SCENE.stackLights * 32, SCENE.ldata, SCENE.stackLights * 8);
+  }
+}
+// 燈光：種類 0 鈉燈（橙）、1 LED（冷白）、2 航空障礙燈（紅、慢閃）、3 綠色導航燈、4 紅色導航燈
+const LIGHT_COL = [[1.0, 0.55, 0.18], [0.85, 0.92, 1.0], [1.0, 0.06, 0.03], [0.1, 1.0, 0.35], [1.0, 0.08, 0.05]];
+const LIGHT_POW = [0.35, 0.45, 0.22, 0.5, 0.5];
+const LIGHT_BUFFERS = [{arrayStride: 32, stepMode: 'instance', attributes: [{shaderLocation: 0, offset: 0, format: 'float32x4'}, {shaderLocation: 1, offset: 16, format: 'float32x4'}]}];
+function writeLight(i) {
+  const l = SCENE.lights[i]; let x = l[0], y = l[1], z = l[2];
+  if (l.length > 6) {   // 煙囪上的障礙燈：l[1] 是高度比例，位置依目前的煙囪高度換算
+    const t = l[1], a = l[7] * 2.094 + l[6], r = 5.2 + 6.3 * Math.pow(1 - t, 1.7) + 1.5;
+    x += Math.cos(a) * r; z += Math.sin(a) * r; y = WORLD.plain + t * stackHeight(l[6]) + 1.5;
+  }
+  const c = LIGHT_COL[l[3]];
+  SCENE.ldata.set([x, y, z, LIGHT_POW[l[3]] * l[4], c[0], c[1], c[2], l[3] + Math.min(l[5], 0.99)], i * 8);
+}
+function buildLightsGPU() {
+  const n = SCENE.lights.length;
+  SCENE.ldata = new Float32Array(n * 8);
+  for (let i = 0; i < n; i++) writeLight(i);
+  SCENE.lbuf = device.createBuffer({size: SCENE.ldata.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST});
+  device.queue.writeBuffer(SCENE.lbuf, 0, SCENE.ldata);
+  // 地面光池：把所有燈畫進一張俯視貼圖（只做一次）
+  const lm = mkTex('lightMap', 1024, 1024, 'rgba16float', GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING);
+  RES.lightMap = lm.view;
+  const ADD = {color: {srcFactor: 'one', dstFactor: 'one', operation: 'add'}, alpha: {srcFactor: 'one', dstFactor: 'one', operation: 'add'}};
+  const P = mkRender({label: 'lightmapGen', id: 'lightmap_gen', targets: [{format: 'rgba16float', blend: ADD}], buffers: LIGHT_BUFFERS, primitive: {topology: 'triangle-strip'}});
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginRenderPass({colorAttachments: [{view: lm.view, clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store'}]});
+  usePipeline(pass, P); pass.setVertexBuffer(0, SCENE.lbuf); pass.draw(4, n); pass.end();
+  device.queue.submit([enc.finish()]);
 }
 function buildSceneGPU() {
   buildMeshes(); buildScene();
@@ -2910,6 +3449,7 @@ function updatePlumeModel() {
   UPlume.set('wind', [M.wd[0], M.wd[1], us, xDraw]).set('prm', [LUT_XMAX, e5.az / Math.max(e5.ay, 1e-3), st[2], hazeK])
     .set('prm2', [M.lid ? M.zi : 0, 0, st[3], r0]).set('obbMin', [...mn, M.cx]).set('obbMax', [...mx, M.cz]);
   PLUME.dirty = false; PLUME.lvCount = 0;
+  updateHeatModel();
 }
 // 每幀：依太陽方向擺放光學深度體積（只包住濃密段，體素才夠細）
 function updatePlumeFrame() {
@@ -2935,8 +3475,48 @@ function updatePlumeFrame() {
   }
   const fl = SCENE.flare || [0, 0, 0];
   const flick = 0.85 + 0.15 * Math.sin(S.simTime * 9.0) * Math.sin(S.simTime * 3.7 + 1.0);
-  UPlume.set('flare', [fl[0], fl[1] + 6, fl[2], 14 * flick]).set('glow', [0.020 * SUN.night, 0.012 * SUN.night, 0.006 * SUN.night, 0]);
+  UPlume.set('flare', [fl[0], fl[1] + 6, fl[2], 500 * flick * (1 - 0.8 * SUN.night)]).set('glow', [0.030 * SUN.night, 0.014 * SUN.night, 0.004 * SUN.night, 0]);
   UPlume.upload();
+}
+
+// ═══ §J5d 分析模式：GPU 熱圖的參數 ═══════════════════════════════════
+// 6 個虛擬測站（名稱是虛構的）
+const STATIONS = [{n: '港區站', x: 1300, z: -1300}, {n: '北岸站', x: 1900, z: -2100}, {n: '山麓站', x: 2600, z: -900},
+                  {n: '市鎮站', x: 1500, z: -3200}, {n: '廠界站', x: 300, z: -150}, {n: '南區站', x: 1700, z: 600}];
+const HEAT = {size: 512, half: 6000, cx: 0, cz: 0, dirty: true, notes: [], lmin: -1, lmax: 2, curtainH: 800, stn: []};
+let UHeat = null;
+const nice125 = (v) => { const e = Math.pow(10, Math.floor(Math.log10(v))), m = v / e; return (m <= 1.0001 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * e; };
+function buildHeatResources() {
+  const U = GPUTextureUsage;
+  HEAT.tex = device.createTexture({label: 'heatTex', size: [HEAT.size, HEAT.size], format: 'r32float', usage: U.STORAGE_BINDING | U.TEXTURE_BINDING | U.COPY_SRC});
+  GPU.tex.push(HEAT.tex);
+  RES.heatTex = RES.heatOut = HEAT.tex.createView();
+  HEAT.dirty = true;
+}
+// 物理模型更新後：把模型參數送給 GPU（熱圖 compute、地面疊圖、剖面都用這份）
+function updateHeatModel() {
+  const M = PLUME.M, mx = PLUME.max, p = S.params;
+  const half = [3000, 4500, 6000, 9000, 12000].find(h => h * 1.5 >= mx.xmax * 2.2) || 12000;    // 熱圖要涵蓋最大落地濃度的位置（留一倍以上餘裕）
+  const cx = M.cx + M.wd[0] * half * 0.55, cz = M.cz + M.wd[1] * half * 0.55;                  // 中心往下風偏，多看下風側
+  const cmaxU = Math.max(mx.cmax * 1e6, 1e-6), lmax = Math.log10(nice125(cmaxU)), Hmax = Math.max(...M.src.map(s => s.hsE + s.dhF));
+  Object.assign(HEAT, {half, cx, cz, lmin: lmax - 3, lmax, curtainH: Math.max(nice125(Hmax * 1.6), M.lid ? M.zi * 1.2 : 0)});
+  M.src.forEach((s, i) => { UHeat.set('src', [s.x, s.z, s.hsE, s.us], i); UHeat.set('rise', [s.K, s.e, s.dhF, s.pen ? 0 : M.Q * 1e6], i); });
+  UHeat.set('sig', [M.k[0], M.k[1], M.k[2], M.k[3]]).set('prm', [M.k[4], M.lid ? M.zi : 0, M.wd[0], M.wd[1]])
+    .set('grid', [half, cx, cz, p.thresh]).set('scale', [HEAT.lmin, lmax, PLUME.xEvap, HEAT.curtainH]).set('mark', [mx.wx, mx.wz, cmaxU, 0]);
+  STATIONS.forEach((s, i) => UHeat.set('stn', [s.x, s.z, 0, 0], i));
+  UHeat.upload();
+  HEAT.dirty = true;
+  HEAT.stn = STATIONS.map(s => PHYS.concAt(M, s.x, s.z, 0) * 1e6);
+  const notes = [];
+  if (mx.cmax <= 0) notes.push('煙流穿透逆溫層：依 ISC3 慣例，地面濃度視為 0');
+  else {
+    if (mx.xmax > half * 1.5) notes.push(`最大落地濃度在下風 ${(mx.xmax / 1000).toFixed(1)} km，超出熱圖範圍`);
+    if (mx.xmax > 10000) notes.push('下風距離超過 10 km：Briggs 擴散係數屬外插');
+    if (M.src.some(s => s.pen)) notes.push('部分煙流穿透逆溫層（那幾支不計入地面濃度）');
+  }
+  if (mx.xmax < 100 && mx.cmax > 0) notes.push('下風距離不到 100 m：Briggs 擴散係數屬外插');
+  HEAT.notes = notes;
+  if (typeof updateReadouts === 'function') updateReadouts();
 }
 
 // ═══ §J6 各個 pass ════════════════════════════════════════════════════
@@ -2949,7 +3529,8 @@ function updateSun() {
   const elDeg = SUN.el / DEG;
   SUN.illum = transCPU(0.05, Math.sin(SUN.el)).map(t => t * ATMO.E0);   // 地面附近的太陽照度（含大氣消光）
   SUN.night = smooth(2.0, -7.0, elDeg);                                 // 夜間係數：燈光依這個值逐漸亮起
-  S.exposure = exposureFor(elDeg) * (S.evBias ? 2 ** S.evBias : 1);
+  // 分析模式把場景提亮一些，底圖才看得清楚（熱圖自己的亮度會依曝光反向補償，不受影響）
+  S.exposure = exposureFor(elDeg) * (S.evBias ? 2 ** S.evBias : 1) * (1 + 1.1 * S.modeK);
 }
 const CAM = {view: null, proj: null, viewProj: m4.ident(), prevViewProj: m4.ident(), right: [1, 0, 0], up: [0, 1, 0], fwd: [0, 0, -1], near: 0.5};
 function updateFrameUniforms() {
@@ -2969,6 +3550,13 @@ function updateFrameUniforms() {
     .set('time', [S.simTime, S.frame, S.modeK, 0]);
   updateShadows();
   UFrame.upload();
+  // 鏡射相機（對 y=0 的水面）：其餘欄位和主相機相同
+  UFrameR.f32.set(UFrame.f32);
+  const mir = (v) => [v[0], -v[1], v[2]];
+  UFrameR.set('viewProj', m4.mul(CAM.proj, m4.mul(CAM.view, m4.S(1, -1, 1)))).set('camPos', [...mir(c.pos), CAM.near])
+    .set('camRight', [...CAM.right, th * aspect]).set('camUp', [...mir(CAM.up), th]).set('camFwd', [...mir(CAM.fwd), S.exposure])
+    .set('viewport', [RT.rw, RT.rh, 1 / RT.rw, 1 / RT.rh]);
+  UFrameR.upload();
   updatePlumeFrame();
   UPost.set('p0', [S.exposure, lerp(0.07, 0.13, SUN.night), S.modeK * 0.7, 0.35]).set('p1', [canvas.width, canvas.height, S.frame % 1024, 1 / TIER.bloomMips]);
   UPost.upload();
@@ -2998,11 +3586,25 @@ function render() {
     cp.end();
   }
   PLUME.lvCount++;
+  // 地面濃度熱圖（compute；只有模型參數變動時重算）
+  if (HEAT.dirty) { const cp = CP(enc, 'heat'); usePipeline(cp, P.heat); cp.dispatchWorkgroups(HEAT.size / 8, HEAT.size / 8); cp.end(); HEAT.dirty = false; }
   // 陰影
   for (let i = 0; i < TIER.shadowN; i++) {
     const pass = RP(enc, 'shadow' + i, {colorAttachments: [], depthStencilAttachment: {view: SHADOW.layers[i], depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store'}});
     usePipeline(pass, P.shadow, {C: SHADOW.ubo[i].buf}, 'c' + i);
     drawScene(pass);
+    pass.end();
+  }
+  // 水面的平面反射：用鏡射相機把水面以上的東西再畫一次（半解析度）
+  {
+    const pass = RP(enc, 'reflect', {
+      colorAttachments: [{view: RT.refl.view, clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store'}],
+      depthStencilAttachment: {view: RT.reflDepth.view, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'discard'},
+    });
+    const o = {F: UFrameR.buf};
+    if (TIER.reflLevel >= 3) { usePipeline(pass, P.terrainR, o, 'r'); pass.setVertexBuffer(0, TERR.vb); pass.setIndexBuffer(TERR.ib, 'uint32'); pass.drawIndexed(TERR.indexCount, TERR.levels); }
+    if (TIER.reflLevel >= 2) { usePipeline(pass, P.meshR, o, 'r'); drawScene(pass); usePipeline(pass, P.flameR, o, 'r'); pass.draw(4); }
+    usePipeline(pass, P.lightsR, o, 'r'); pass.setVertexBuffer(0, SCENE.lbuf); pass.draw(4, SCENE.lights.length);
     pass.end();
   }
   // 主場景
@@ -3017,6 +3619,9 @@ function render() {
     usePipeline(pass, P.mesh); drawScene(pass);
     usePipeline(pass, P.water); pass.draw(4);
     usePipeline(pass, P.sky); pass.draw(3);
+    if (S.modeK > 0.003) { usePipeline(pass, P.curtain); pass.draw(4); }   // 分析模式：下風軸線的垂直剖面
+    usePipeline(pass, P.flame); pass.draw(4);
+    usePipeline(pass, P.lights); pass.setVertexBuffer(0, SCENE.lbuf); pass.draw(4, SCENE.lights.length);
     pass.end();
   }
   if (RT.msColor) {
@@ -3050,8 +3655,10 @@ function render() {
     }
   }
   {
-    const pass = RP(enc, 'final', {colorAttachments: [{view: context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store'}]});
+    const cv = context.getCurrentTexture().createView();
+    const pass = RP(enc, 'final', {colorAttachments: [{view: RT.ldr ? RT.ldr.view : cv, loadOp: 'clear', storeOp: 'store'}]});
     usePipeline(pass, P.final); pass.draw(3); pass.end();
+    if (RT.ldr) fsPass(enc, 'fxaa', P.fxaa, cv);
   }
   const after = timerResolve(enc);
   device.queue.submit([enc.finish()]);
@@ -3063,6 +3670,7 @@ function render() {
 const KEYS = new Set();
 const INPUT = {locked: false, dragging: false, lx: 0, ly: 0, joy: [0, 0], lift: 0};
 function userActed() {
+  if (S.tour) { S.tour = null; const b = $('#bTour'); if (b) b.setAttribute('aria-pressed', 'false'); }   // 一操作就結束導覽
   if (S.userActed) return;
   S.userActed = true;
   S.cam.fovTarget = 45 * DEG;
@@ -3103,6 +3711,7 @@ function initInput() {
 }
 function updateCamera(dt) {
   const c = S.cam;
+  if (updateFly(dt) || updateTour(dt)) return;
   if (!S.userActed && !CFG.shot && !CFG.bench) {
     // 使用者還沒操作：鏡頭緩慢推移
     const f = dirFromAzEl(c.yaw, 0), r = [Math.cos(c.yaw), 0, Math.sin(c.yaw)];
@@ -3123,8 +3732,217 @@ function updateCamera(dt) {
   c.vel = v3.lerp(c.vel, want, k);
   c.pos = v3.add(c.pos, v3.scale(c.vel, dt));
   c.pos[0] = clamp(c.pos[0], -11500, 11500); c.pos[2] = clamp(c.pos[2], -11500, 11500);
-  c.pos[1] = clamp(c.pos[1], Math.max(heightAt(c.pos[0], c.pos[2]) + 2, 1.5), 6000);   // 不穿地、不潛水
+  c.pos[1] = clamp(c.pos[1], Math.max(heightAt(c.pos[0], c.pos[2]) + 2, 1.5), 9000);   // 不穿地、不潛水
   c.fov = lerp(c.fov, c.fovTarget, 1 - Math.exp(-dt * 2.2));
+}
+
+// ═══ §J8 介面 ═════════════════════════════════════════════════════════
+const COMPASS16 = ['北', '北北東', '東北', '東北東', '東', '東南東', '東南', '南南東', '南', '南南西', '西南', '西南西', '西', '西北西', '西北', '北北西'];
+const compassName = (deg) => COMPASS16[Math.round((((deg % 360) + 360) % 360) / 22.5) % 16];
+const TOUCH = matchMedia('(pointer: coarse)').matches || (navigator.maxTouchPoints > 0 && /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent));
+// 可調參數（範圍取實務上合理的值）
+const PARAM_DEFS = [
+  {sec: '氣象'},
+  {k: 'u10', label: '風速（10 m 高）', unit: 'm/s', min: 0.5, max: 15, step: 0.1, dp: 1},
+  {k: 'windFrom', label: '風向（來向）', min: 0, max: 359, step: 1, fmt: (v) => `${v}° ${compassName(v)}風`},
+  {k: 'cls', label: '大氣穩定度', type: 'opts', opts: [['A', 'A', '極不穩定：強日照、弱風'], ['B', 'B', '不穩定'], ['C', 'C', '弱不穩定'], ['D', 'D', '中性：陰天、風大、日出日落前後'], ['E', 'E', '弱穩定：夜間'], ['F', 'F', '穩定：晴朗無風的夜晚']],
+   fmt: (v) => ({A: '極不穩定', B: '不穩定', C: '弱不穩定', D: '中性', E: '弱穩定', F: '穩定'})[v]},
+  {k: 'urban', label: '擴散參數', type: 'opts', opts: [['false', '鄉村', 'Briggs 開闊地'], ['true', '都市', 'Briggs 都市（重工業區適用）']], parse: (v) => v === 'true'},
+  {k: 'rh', label: '相對濕度', unit: '%', min: 30, max: 99, step: 1, dp: 0},
+  {k: 'Ta', label: '氣溫', unit: '°C', min: 5, max: 38, step: 0.5, dp: 1},
+  {k: 'lid', label: '逆溫層（混合層頂）', type: 'check'},
+  {k: 'zi', label: '混合層高度', unit: 'm', min: 200, max: 2000, step: 10, dp: 0},
+  {sec: '排放'},
+  {k: 'hs', label: '煙囪高度（最高的一支）', unit: 'm', min: 100, max: 300, step: 5, dp: 0},
+  {k: 'Q', label: '排放量 Q（每支）', unit: 'g/s', min: 10, max: 1000, step: 10, dp: 0},
+  {k: 'Ts', label: '排氣溫度', unit: '°C', min: 40, max: 200, step: 1, dp: 0},
+  {k: 'vs', label: '排氣速度', unit: 'm/s', min: 5, max: 35, step: 0.5, dp: 1},
+  {sec: '分析'},
+  {k: 'thresh', label: '門檻線（示意值）', unit: 'μg/m³', min: 1, max: 500, log: true, dp: 0},
+];
+const UI = {tags: {}, notes: '', hintT: 0};
+const clockText = () => { const t = Math.round(18 * 60 + 2 + S.timeMin); return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`; };
+function buildUI() {
+  let html = '';
+  for (const d of PARAM_DEFS) {
+    const id = 'p_' + d.k;
+    if (d.sec) html += `<h2>${d.sec}</h2>`;
+    else if (d.type === 'opts') html += `<div class="row" role="radiogroup" aria-labelledby="${id}_l"><span class="lab" id="${id}_l">${d.label}</span><output id="${id}_o"></output><div class="opts">${d.opts.map(([v, t, tip]) => `<label title="${tip}"><input type="radio" name="${id}" value="${v}">${t}</label>`).join('')}</div></div>`;
+    else if (d.type === 'check') html += `<div class="chk"><input type="checkbox" id="${id}"><label for="${id}">${d.label}</label></div>`;
+    else html += `<div class="row"><label for="${id}">${d.label}</label><output id="${id}_o" for="${id}"></output><input type="range" id="${id}" min="${d.log ? 0 : d.min}" max="${d.log ? 1000 : d.max}" step="${d.log ? 1 : d.step}"></div>`;
+  }
+  html += `<h2>計算結果</h2><dl id="derived"></dl><p class="note">三支煙囪的濃度相加。煙囪出口內徑 8 m；高度超過 10 m 的風速用冪次律修正。</p>
+    <h2>畫面</h2>
+    <div class="row"><label for="p_q">畫質</label><output id="p_q_o"></output><select id="p_q"><option value="ultra">ultra（最高）</option><option value="high">high</option><option value="medium">medium</option><option value="low">low（手機）</option></select></div>
+    <div class="row"><label for="p_ev">曝光補償</label><output id="p_ev_o" for="p_ev"></output><input type="range" id="p_ev" min="-2" max="2" step="0.1"></div>
+    <div class="row"><label for="p_fov">視角 FOV</label><output id="p_fov_o" for="p_fov"></output><input type="range" id="p_fov" min="12" max="80" step="1"></div>
+    <p class="note" id="gpuNote"></p>`;
+  $('#panel').innerHTML = html;
+  $('#timebox').innerHTML = `<div class="row"><label for="p_time">時間</label><output id="p_time_o" for="p_time"></output><input type="range" id="p_time" min="-60" max="60" step="0.5"></div>`;
+  const dirty = () => { S.paramsDirty = true; syncUI(); };
+  for (const d of PARAM_DEFS) {
+    if (d.sec) continue;
+    const id = '#p_' + d.k;
+    if (d.type === 'opts') document.querySelectorAll(`input[name="p_${d.k}"]`).forEach(r => r.addEventListener('change', () => { S.params[d.k] = d.parse ? d.parse(r.value) : r.value; dirty(); }));
+    else if (d.type === 'check') $(id).addEventListener('change', (e) => { S.params[d.k] = e.target.checked; dirty(); });
+    else $(id).addEventListener('input', (e) => { const s = +e.target.value; S.params[d.k] = d.log ? Math.round(d.min * Math.pow(d.max / d.min, s / 1000)) : s; dirty(); });
+  }
+  $('#p_time').addEventListener('input', (e) => { S.timeMin = +e.target.value; S.tour = null; syncUI(); });
+  $('#p_ev').addEventListener('input', (e) => { S.evBias = +e.target.value; syncUI(); });
+  $('#p_fov').addEventListener('input', (e) => { S.cam.fov = S.cam.fovTarget = +e.target.value * DEG; S.userActed = true; syncUI(); });
+  $('#p_q').addEventListener('change', (e) => setQuality(e.target.value));
+  $('#bScene').addEventListener('click', () => setMode(0));
+  $('#bAnalysis').addEventListener('click', () => setMode(1));
+  $('#bPanel').addEventListener('click', () => { const p = $('#panel'); p.hidden = !p.hidden; $('#bPanel').setAttribute('aria-expanded', String(!p.hidden)); });
+  $('#bPhoto').addEventListener('click', () => setPhoto(true));
+  $('#bTop').addEventListener('click', () => flyTo({pos: [HEAT.cx, Math.min(HEAT.half * 2.4, 26000), HEAT.cz + 2], yaw: 0, pitch: -89.5 * DEG, fov: 50 * DEG}, 2.2));
+  $('#bTour').addEventListener('click', () => { if (typeof toggleTour === 'function') toggleTour(); });
+  window.addEventListener('keydown', (e) => { if (e.code === 'KeyP' && !/^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) setPhoto(!$('#ui').classList.contains('photo')); });
+  canvas.addEventListener('pointerdown', () => { if ($('#ui').classList.contains('photo')) setPhoto(false); });
+  // 標籤：6 個測站、最大落地濃度、白煙蒸發處
+  const L = $('#labels');
+  for (const k of ['s0', 's1', 's2', 's3', 's4', 's5', 'max', 'ev']) { const t = document.createElement('div'); t.className = 'tag' + (k === 'max' ? ' max' : k === 'ev' ? ' ev' : ''); t.style.display = 'none'; L.appendChild(t); UI.tags[k] = t; }
+  $('#hint').textContent = TOUCH ? '左下搖桿移動　拖曳畫面轉視角　右下按鈕升降' : '點一下畫面後：滑鼠轉視角　W A S D 移動　Space／Shift 升降　滾輪調速度';
+  if (CFG.shot) $('#hint').classList.add('off');
+  else setTimeout(() => $('#hint').classList.add('off'), 3000);   // 操作提示 3 秒後淡出
+  if (TOUCH) { $('#joy').hidden = false; $('#lift').hidden = false; initTouch(); }
+  if (innerWidth > 900 && !CFG.shot) { $('#panel').hidden = false; $('#bPanel').setAttribute('aria-expanded', 'true'); }
+  if (CFG.shot === 5) { $('#panel').hidden = false; }
+  syncUI();
+}
+function setPhoto(on) { $('#ui').classList.toggle('photo', on); }
+function setMode(m) {
+  S.mode = m;
+  $('#bScene').setAttribute('aria-pressed', String(m === 0)); $('#bAnalysis').setAttribute('aria-pressed', String(m === 1));
+  $('#legend').hidden = m !== 1; $('#bTop').hidden = m !== 1;
+  if (m === 1) updateLegend();
+}
+function syncUI() {
+  const p = S.params;
+  for (const d of PARAM_DEFS) {
+    if (d.sec) continue;
+    const el = $('#p_' + d.k), o = $('#p_' + d.k + '_o'), v = p[d.k];
+    if (d.type === 'opts') { document.querySelectorAll(`input[name="p_${d.k}"]`).forEach(r => { r.checked = r.value === String(v); }); if (o) o.textContent = d.fmt ? d.fmt(v) : ''; }
+    else if (d.type === 'check') el.checked = !!v;
+    else { el.value = d.log ? Math.round(1000 * Math.log(v / d.min) / Math.log(d.max / d.min)) : v; o.textContent = d.fmt ? d.fmt(v) : `${(+v).toFixed(d.dp)} ${d.unit}`; }
+  }
+  $('#p_zi').disabled = !p.lid;
+  $('#p_time').value = S.timeMin;
+  $('#p_time_o').textContent = `${clockText()}　太陽高度 ${(-S.timeMin * 0.225).toFixed(1)}°`;
+  $('#p_ev').value = S.evBias || 0; $('#p_ev_o').textContent = `${(S.evBias || 0) >= 0 ? '+' : ''}${(S.evBias || 0).toFixed(1)} EV`;
+  $('#p_fov').value = Math.round(S.cam.fov / DEG); $('#p_fov_o').textContent = `${Math.round(S.cam.fov / DEG)}°`;
+  $('#p_q').value = TIER.name;
+  $('#windArrow').setAttribute('transform', `rotate(${p.windFrom + 180})`);
+  $('#windText').textContent = `${compassName(p.windFrom)}風 ${p.u10.toFixed(1)} m/s`;
+  $('#gpuNote').textContent = `顯示卡：${GPU.glName || GPU.adapterName}${GPU.software ? '（軟體渲染，效能會很差）' : ''}`;
+}
+function updateReadouts() {
+  if (!PLUME.M || !$('#derived')) return;
+  const M = PLUME.M, s = M.src[1], mx = PLUME.max, row = (a, b) => `<dt>${a}</dt><dd>${b}</dd>`;
+  $('#derived').innerHTML =
+    row('煙囪口風速', `${s.us.toFixed(1)} m/s`) + row('浮力通量 F', `${s.F.toFixed(0)} m⁴/s³`) +
+    row(`最終浮升 Δh（${s.buoy ? '浮力' : '動量'}主導）`, `${s.dhF.toFixed(0)} m`) + row('到達最終浮升的距離', `${s.xf.toFixed(0)} m`) +
+    row('有效高度 H', `${(s.hsE + s.dhF).toFixed(0)} m`) +
+    row('最大落地濃度 Cmax', mx.cmax > 0 ? `${(mx.cmax * 1e6).toPrecision(3)} μg/m³` : '0') +
+    row('發生位置 xmax', mx.cmax > 0 ? `下風 ${(mx.xmax / 1000).toFixed(2)} km` : '—') +
+    row('白煙可見長度', `約 ${PLUME.xEvap.toFixed(0)} m`);
+  const txt = HEAT.notes.map(n => `<div>${n}</div>`).join('');
+  if (txt !== UI.notes) { UI.notes = txt; $('#notice').innerHTML = txt; }
+  updateLegend();
+}
+function updateLegend() {
+  // 色階條：和著色器同一個 viridis 多項式
+  const vir = (t) => { const c = [[0.2777273272234177, 0.005407344544966578, 0.3340998053353061], [0.1050930431085774, 1.404613529898575, 1.384590162594685], [-0.3308618287255563, 0.214847559468213, 0.09509516302823659], [-4.634230498983486, -5.799100973351585, -19.33244095627987], [6.228269936347081, 14.17993336680509, 56.69055260068105], [4.776384997670288, -13.74514537774601, -65.35303263337234], [-5.435455855934631, 4.645852612178535, 26.3124352495832]];
+    return [0, 1, 2].map(k => { let v = 0; for (let i = 6; i >= 0; i--) v = v * t + c[i][k]; return Math.round(clamp(v, 0, 1) * 255); }); };
+  const stops = []; for (let i = 0; i <= 12; i++) stops.push(`rgb(${vir(i / 12).join(',')}) ${(i / 12 * 100).toFixed(1)}%`);
+  let ticks = '';
+  for (let l = Math.ceil(HEAT.lmin - 1e-6); l <= HEAT.lmax + 1e-6; l++) for (const m of [1, 2, 5]) {
+    const lv = l + Math.log10(m); if (lv > HEAT.lmax + 1e-6) break;
+    const v = Math.pow(10, lv);
+    ticks += `<span class="tick" style="left:${((lv - HEAT.lmin) / (HEAT.lmax - HEAT.lmin) * 100).toFixed(2)}%">${v >= 1 ? +v.toPrecision(2) : v.toPrecision(1)}</span>`;
+  }
+  const b = $('#legendBar'); b.style.background = `linear-gradient(90deg, ${stops.join(',')})`; b.innerHTML = ticks;
+}
+// 每幀：把世界座標的標籤投影到螢幕
+function updateLabels() {
+  if (!UI.tags.max) return;   // 介面還沒建好
+  const show = S.modeK > 0.5 && PLUME.M && !$('#ui').classList.contains('photo');
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const put = (key, pos, html) => {
+    const t = UI.tags[key], c = show ? m4.xform(CAM.viewProj, pos) : null;
+    if (!c || c[3] <= 0.1 || Math.abs(c[0] / c[3]) > 1.1 || Math.abs(c[1] / c[3]) > 1.1) { t.style.display = 'none'; return; }
+    t.style.display = ''; t.style.transform = `translate(${((c[0] / c[3] * 0.5 + 0.5) * w).toFixed(1)}px, ${((0.5 - c[1] / c[3] * 0.5) * h).toFixed(1)}px) translate(-50%, -130%)`;
+    if (t._h !== html) { t._h = html; t.innerHTML = html; }
+  };
+  const fmtC = (v) => v >= 100 ? v.toFixed(0) : v >= 1 ? v.toPrecision(3) : v >= 0.01 ? v.toFixed(2) : '< 0.01';
+  STATIONS.forEach((s, i) => put('s' + i, [s.x, heightAt(s.x, s.z) + 8, s.z], `${s.n} <b>${fmtC(HEAT.stn[i] || 0)}</b> μg/m³`));
+  const mx = PLUME.max;
+  if (show && mx && mx.cmax > 0) put('max', [mx.wx, heightAt(mx.wx, mx.wz) + 8, mx.wz], `最大落地濃度 <b>${fmtC(mx.cmax * 1e6)}</b> μg/m³　下風 <b>${(mx.xmax / 1000).toFixed(2)}</b> km`);
+  else UI.tags.max.style.display = 'none';
+  if (show) { const M = PLUME.M, s = M.src[1], x = PLUME.xEvap; put('ev', [s.x + M.wd[0] * x, WORLD.plain + s.hsE + PHYS.dhAt(s, Math.max(x, 1)) + 120, s.z + M.wd[1] * x], `白煙到此蒸發（約 <b>${x.toFixed(0)}</b> m）<br>污染物繼續往下風擴散`); }
+  else UI.tags.ev.style.display = 'none';
+}
+// 鏡頭平滑移動（俯視全區、導覽共用）
+function flyTo(to, dur) { const c = S.cam; S.fly = {t: 0, dur, from: {pos: [...c.pos], yaw: c.yaw, pitch: c.pitch, fov: c.fov}, to}; S.userActed = true; c.vel = [0, 0, 0]; }
+function updateFly(dt) {
+  const f = S.fly; if (!f) return false;
+  f.t = Math.min(f.t + dt / f.dur, 1);
+  const k = f.t * f.t * (3 - 2 * f.t), c = S.cam;
+  let dy = f.to.yaw - f.from.yaw; dy = ((dy + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+  c.pos = v3.lerp(f.from.pos, f.to.pos, k); c.yaw = (f.from.yaw + dy * k + Math.PI * 2) % (Math.PI * 2);
+  c.pitch = lerp(f.from.pitch, f.to.pitch, k); c.fov = c.fovTarget = lerp(f.from.fov, f.to.fov, k);
+  if (f.t >= 1) S.fly = null;
+  return true;
+}
+// 60 秒導覽運鏡（方便錄影）：[秒, 位置, 方位°, 仰角°, FOV°, 相對日落的分鐘]
+const TOUR = [
+  [0,  [2750, 145, -150], 270, -1.0, 24, -17],
+  [12, [1500, 95, -260],  265, 0.5,  34, -14],
+  [24, [330, 330, 430],   312, -4,   42, -9],
+  [36, [520, 395, -420],  236, -7,   52, -3],
+  [48, [1180, 60, -260],  257, 3,    44, 16],
+  [60, [2500, 420, 520],  283, -9,   40, 34],
+];
+function toggleTour() {
+  S.tour = S.tour ? null : {t: 0};
+  $('#bTour').setAttribute('aria-pressed', String(!!S.tour));
+  if (S.tour) { S.userActed = true; S.fly = null; }
+}
+function updateTour(dt) {
+  if (!S.tour) return false;
+  const T = TOUR, t = S.tour.t = Math.min(S.tour.t + dt, T[T.length - 1][0]);
+  let i = 0; while (i < T.length - 2 && t > T[i + 1][0]) i++;
+  const a = T[i], b = T[i + 1], u = (t - a[0]) / (b[0] - a[0]), k = u * u * (3 - 2 * u), c = S.cam;
+  let dy = (b[2] - a[2]) * DEG; dy = ((dy + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+  c.pos = v3.lerp(a[1], b[1], k); c.yaw = (a[2] * DEG + dy * k + Math.PI * 2) % (Math.PI * 2);
+  c.pitch = lerp(a[3], b[3], k) * DEG; c.fov = c.fovTarget = lerp(a[4], b[4], k) * DEG;
+  S.timeMin = lerp(a[5], b[5], k);
+  if (S.frame % 20 === 0) syncUI();
+  if (t >= T[T.length - 1][0]) { S.tour = null; $('#bTour').setAttribute('aria-pressed', 'false'); }
+  return true;
+}
+// 手機：左下虛擬搖桿移動、拖曳畫面轉視角、右下兩顆鍵升降
+function initTouch() {
+  const joy = $('#joy'), knob = joy.querySelector('i');
+  let jid = -1;
+  const setJ = (e) => {
+    const r = joy.getBoundingClientRect(), x = (e.clientX - r.left - r.width / 2) / (r.width / 2), y = (e.clientY - r.top - r.height / 2) / (r.height / 2), l = Math.max(Math.hypot(x, y), 1);
+    INPUT.joy = [x / l, -y / l]; knob.style.transform = `translate(${x / l * 36}px, ${y / l * 36}px)`; userActed();
+  };
+  joy.addEventListener('pointerdown', (e) => { jid = e.pointerId; joy.setPointerCapture(jid); setJ(e); e.preventDefault(); });
+  joy.addEventListener('pointermove', (e) => { if (e.pointerId === jid) setJ(e); });
+  const endJ = (e) => { if (e.pointerId === jid) { jid = -1; INPUT.joy = [0, 0]; knob.style.transform = ''; } };
+  joy.addEventListener('pointerup', endJ); joy.addEventListener('pointercancel', endJ);
+  for (const [id, v] of [['#bUp', 1], ['#bDown', -1]]) {
+    const b = $(id);
+    b.addEventListener('pointerdown', (e) => { INPUT.lift = v; userActed(); e.preventDefault(); });
+    for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) b.addEventListener(ev, () => { INPUT.lift = 0; });
+  }
+  let lid = -1, lx = 0, ly = 0;
+  canvas.addEventListener('pointerdown', (e) => { if (e.pointerType !== 'mouse' && lid < 0) { lid = e.pointerId; lx = e.clientX; ly = e.clientY; } });
+  canvas.addEventListener('pointermove', (e) => { if (e.pointerId === lid) { lookBy((lx - e.clientX) * 1.6, (ly - e.clientY) * 1.6); lx = e.clientX; ly = e.clientY; userActed(); } });
+  const endL = (e) => { if (e.pointerId === lid) lid = -1; };
+  canvas.addEventListener('pointerup', endL); canvas.addEventListener('pointercancel', endL);
 }
 
 // ═══ §J9 測試鉤子 ═════════════════════════════════════════════════════
@@ -3133,8 +3951,8 @@ const SHOTS = {
   1: {pos: [2750, null, -150], yaw: 270, pitch: -1.0, fov: 24, time: -16.7, mode: 0},                 // 開場黃昏全景
   2: {pos: [235, 292, 345], target: [70, 292, 70], fov: 34, time: -16.7, mode: 0},                    // 近看煙囪出口與煙流
   3: {pos: [182, 300, -34], target: [-815, 366, 10], fov: 55, time: -16.7, mode: 0},                  // 在煙流裡往太陽看
-  4: {pos: [1330, 46, -330], target: [0, 120, 130], fov: 38, time: 34, mode: 0},                      // 夜晚燈海與倒影
-  5: {pos: [1150, 5600, -1050], target: [1150, 0, -1049], fov: 50, time: -16.7, mode: 1},             // 分析模式俯視
+  4: {pos: [1080, 34, -190], target: [-60, 118, 150], fov: 44, time: 34, mode: 0},                    // 夜晚燈海與倒影
+  5: {pos: [1500, 7400, -1500], yaw: 0, pitch: -89.5, fov: 50, time: -16.7, mode: 1},                 // 分析模式俯視（北方朝上）
   6: {pos: [2750, null, -150], yaw: 268.2, pitch: 0.4, fov: 31, time: -16.7, mode: 0},                // 手機直式開場
 };
 function applyShot(n) {
@@ -3163,6 +3981,52 @@ function selftestCPU() {
   chk('d', '風速加倍後的濃度比（應為 0.5）', c2 / c1, 0.5, 1e-9);
   return out;
 }
+// selftest e：GPU（WGSL f32）算的熱圖回讀 3 個點，和 JavaScript（double）的參考值比對
+async function selftestGPU() {
+  if (PLUME.dirty || !PLUME.M) { updateStacks(); updatePlumeModel(); }
+  const N = HEAT.size, enc = device.createCommandEncoder(), cp = enc.beginComputePass();
+  usePipeline(cp, GPU.pipelines.heat); cp.dispatchWorkgroups(N / 8, N / 8); cp.end();
+  const buf = device.createBuffer({size: N * N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST});
+  enc.copyTextureToBuffer({texture: HEAT.tex}, {buffer: buf, bytesPerRow: N * 4}, [N, N]);
+  device.queue.submit([enc.finish()]);
+  await buf.mapAsync(GPUMapMode.READ);
+  const g = new Float32Array(buf.getMappedRange().slice(0)); buf.unmap();
+  const M = PLUME.M, mx = PLUME.max, out = [];
+  // 三個點：最大落地濃度附近、上游一半距離偏 60 m、下游 1.7 倍距離偏 −120 m
+  [[1, 0, '最大落地濃度附近'], [0.5, 60, '0.5·xmax、橫向 60 m'], [1.7, -120, '1.7·xmax、橫向 −120 m']].forEach(([fx, dy, name], k) => {
+    const w = PHYS.relToWorld(M, mx.xmax * fx, mx.ymax + dy);
+    const i = clamp(Math.floor(((w[0] - HEAT.cx) / (2 * HEAT.half) + 0.5) * N), 0, N - 1), j = clamp(Math.floor(((w[1] - HEAT.cz) / (2 * HEAT.half) + 0.5) * N), 0, N - 1);
+    const tx = HEAT.cx + ((i + 0.5) / N - 0.5) * 2 * HEAT.half, tz = HEAT.cz + ((j + 0.5) / N - 0.5) * 2 * HEAT.half;   // 該 texel 中心的世界座標
+    const ref = PHYS.concAt(M, tx, tz, 0) * 1e6, val = g[j * N + i], err = Math.abs(val - ref) / Math.max(Math.abs(ref), 1e-12), ok = err < 0.01;
+    out.push({id: 'e' + (k + 1), name: 'GPU 熱圖 vs JS：' + name, val, ref, err, ok});
+    console.log(`SELFTEST ${ok ? 'PASS' : 'FAIL'} e${k + 1} GPU 熱圖回讀（${name}，世界座標 x=${tx.toFixed(0)} z=${tz.toFixed(0)}）：GPU=${val.toPrecision(7)} μg/m³，JS=${ref.toPrecision(7)} μg/m³，相對誤差=${(err * 100).toExponential(3)}%（門檻 1%）`);
+  });
+  HEAT.dirty = true;
+  return out;
+}
+// ?bench=1：20 秒固定路徑。每幀送出後等 GPU 做完再送下一幀，量到的是不受螢幕更新率限制的幀時間
+async function runBench() {
+  await new Promise(r => setTimeout(r, 1500));
+  LOOP.manual = true; TIMER.active = true; TIMER.acc = {}; TIMER.n = 0;
+  S.renderScale = 1; S.userActed = true; S.frozen = false; S.tour = null;
+  const y0 = heightAt(2750, -150) + 22, times = [], t0 = performance.now();
+  let last = t0;
+  while (performance.now() - t0 < 20000 && GPU.ready) {
+    const s = (performance.now() - t0) / 20000, k = s * s * (3 - 2 * s);
+    S.cam.pos = v3.lerp([2750, y0, -150], [900, 210, -520], k); S.cam.yaw = lerp(270, 248, k) * DEG; S.cam.pitch = lerp(-1, -7, k) * DEG; S.cam.fov = S.cam.fovTarget = lerp(24, 50, k) * DEG;
+    S.cam.vel = [0, 0, 0]; S.simTime += 1 / 60; S.modeK = 0;
+    render();
+    await device.queue.onSubmittedWorkDone();
+    const n = performance.now(); times.push(n - last); last = n;
+  }
+  const t = times.slice(20).sort((a, b) => a - b), avg = t.reduce((a, b) => a + b, 0) / t.length, p95 = t[Math.floor(t.length * 0.95)], passes = {};
+  for (const k in TIMER.acc) passes[k] = +(TIMER.acc[k] / Math.max(TIMER.n, 1)).toFixed(3);
+  const gpuTotal = +Object.values(passes).reduce((a, b) => a + b, 0).toFixed(2);
+  window.__bench = {frames: t.length, avgMs: +avg.toFixed(2), p95Ms: +p95.toFixed(2), fps: +(1000 / avg).toFixed(1), resolution: [RT.w, RT.h], canvas: [canvas.width, canvas.height],
+    tier: TIER.name, adapter: GPU.adapterName, renderer: GPU.glName, software: GPU.software, timestampQuery: TIMER.ok, gpuPassMs: passes, gpuPassTotalMs: gpuTotal, timedFrames: TIMER.n};
+  console.log('BENCH ' + JSON.stringify(window.__bench));
+  TIMER.active = false; LOOP.manual = false; S.resetDt = true;
+}
 async function runSelftest() {
   const res = selftestCPU();
   window.__selftest = {items: res, done: false};
@@ -3182,9 +4046,10 @@ window.__scene = {
     if (o.fovDeg !== undefined) { c.fov = c.fovTarget = o.fovDeg * DEG; }
     S.userActed = true; c.vel = [0, 0, 0]; S.volReset = true;
   },
-  setTime(min) { S.timeMin = clamp(+min, -90, 75); },
-  setParams(o) { Object.assign(S.params, o); S.paramsDirty = true; },
-  setMode(m) { S.mode = (m === 1 || m === 'analysis') ? 1 : 0; },
+  setTime(min) { S.timeMin = clamp(+min, -90, 75); if ($('#p_time')) syncUI(); },
+  setParams(o) { Object.assign(S.params, o); S.paramsDirty = true; if ($('#p_time')) syncUI(); },
+  setMode(m) { const v = (m === 1 || m === 'analysis') ? 1 : 0; if ($('#p_time')) setMode(v); else S.mode = v; },
+  setQuality(q) { return setQuality(q); },
   getState() { return JSON.parse(JSON.stringify({cam: S.cam, timeMin: S.timeMin, params: S.params, mode: S.mode, tier: TIER.name, res: [RT.w, RT.h], canvas: [canvas.width, canvas.height], adapter: GPU.adapterName, gl: GPU.glName, software: GPU.software, features: GPU.features, frame: S.frame, errors: S.errors.length})); },
 };
 
@@ -3194,6 +4059,7 @@ function update(dt) {
   S.modeK = lerp(S.modeK, S.mode, 1 - Math.exp(-dt * 3.5));
   if (Math.abs(S.modeK - S.mode) < 0.002) S.modeK = S.mode;
   updateCamera(dt);
+  updateLabels();
 }
 const LOOP = {lastRaf: 0, lastTick: 0, starved: false, gpuBusy: false, manual: false};
 function tick(nowMs) {
@@ -3205,7 +4071,15 @@ function tick(nowMs) {
   try {
     update(dt); render();
     LOOP.gpuBusy = true;   // GPU 還沒做完上一幀就不再送，避免工作堆積
-    device.queue.onSubmittedWorkDone().then(() => { LOOP.gpuBusy = false; }, () => { LOOP.gpuBusy = false; });
+    const t0 = performance.now();
+    device.queue.onSubmittedWorkDone().then(() => { LOOP.gpuBusy = false; const ms = performance.now() - t0; S.gpuMs = S.gpuMs ? lerp(S.gpuMs, ms, 0.08) : ms; }, () => { LOOP.gpuBusy = false; });
+    S.fpsEma = lerp(S.fpsEma || 60, 1 / Math.max(dt, 1e-3), 0.05);
+    // 動態解析度：GPU 一幀超過約 18 ms 就降一級，低於 10 ms 再慢慢升回來
+    if (!CFG.shot && S.frame % 30 === 0 && S.gpuMs) {
+      if (S.gpuMs > 18.5 && S.renderScale > TIER.minScale + 1e-3) { S.renderScale = Math.max(TIER.minScale, S.renderScale - 0.1); S.drsHold = 6; }
+      else if (S.gpuMs < 10.5 && S.renderScale < 1) { if (S.drsHold > 0) S.drsHold--; else S.renderScale = Math.min(1, S.renderScale + 0.1); }
+      if (CFG.debug) { const st = $('#stat'); st.hidden = false; st.textContent = `${S.fpsEma.toFixed(0)} fps｜GPU ${S.gpuMs.toFixed(1)} ms｜${RT.w}×${RT.h}（×${(S.renderScale * TIER.maxScale).toFixed(2)}）｜${TIER.name}`; }
+    }
   } catch (e) { reportError('[frame] ' + (e.stack || e)); GPU.ready = false; }
   if (CFG.shot && !window.__shotReady && S.frame >= 90 && !S.errors.length) { window.__shotReady = true; console.log('SHOT_READY'); }
 }
@@ -3225,29 +4099,48 @@ setInterval(() => {
   if (LOOP.starved && n - LOOP.lastTick > 15) tick(n);
 }, 8);
 document.addEventListener('visibilitychange', () => { S.resetDt = true; });   // 分頁切回來時不用累積的時間差
+// 建立（或重建）所有 GPU 資源：啟動、device lost、切換畫質等級時都走這裡。CPU 端的場景資料會保留重傳
+async function buildAll() {
+  GPU.ready = false;
+  for (const t of GPU.tex) t.destroy();
+  for (const b of GPU.buf) b.destroy();
+  GPU.tex = []; GPU.buf = [];
+  for (const k of Object.keys(RT)) delete RT[k];
+  for (const k of Object.keys(RES)) delete RES[k];
+  GPU.bglCache.clear(); GPU.gen++;
+  TIER = pickTier();
+  GPU.consts = {SHADOW_TAPS: TIER.pcf, VOL_STEPS: TIER.volSteps, FOG_STEPS: TIER.fogSteps, VOL_DIV: TIER.volDiv.toFixed(1)};
+  timerInit();
+  buildStatic();
+  await buildTerrain();
+  buildSceneGPU();
+  buildLightsGPU();
+  buildHeatResources();
+  buildPlumeResources();
+  buildPipelines();
+  allocTargets();
+  GPU.ready = true; S.resetDt = true;
+}
+async function setQuality(name) {
+  if (!TIERS[name] || name === TIER.name) return;
+  S.forceTier = name; S.renderScale = 1;
+  try { await buildAll(); } catch (e) { reportError('[setQuality] ' + (e.stack || e)); }
+  syncUI();
+}
 async function start(isRestart) {
   try {
     if (!(await initGPU())) return;
-    for (const k of Object.keys(RT)) delete RT[k];
-    for (const k of Object.keys(RES)) delete RES[k];
-    GPU.bglCache.clear(); GPU.gen++;
-    TIER = pickTier();
-    GPU.consts = {SHADOW_TAPS: TIER.pcf, VOL_STEPS: TIER.volSteps, FOG_STEPS: TIER.fogSteps, VOL_DIV: TIER.volDiv.toFixed(1)};
-    timerInit();
-    buildStatic();
-    await buildTerrain();
-    buildSceneGPU();
-    buildPlumeResources();
-    buildPipelines();
-    allocTargets();
+    GPU.tex = []; GPU.buf = [];   // 舊 device 的資源已經失效，不用逐一 destroy
+    await buildAll();
     if (!isRestart && !S.camPlaced) { S.cam.pos[1] = heightAt(S.cam.pos[0], S.cam.pos[2]) + 22; S.camPlaced = true; }
-    GPU.ready = true; S.resetDt = true;
     console.log(`[海港夕煙] adapter=${GPU.adapterName} | ${GPU.glName} | 軟體渲染=${GPU.software} | 畫質=${TIER.name} | features=${GPU.features.join(',')}`);
     if (!isRestart) {
       initInput();
       if (CFG.shot) { S.frozen = true; S.simTime = 40; applyShot(CFG.shot); }
       else { S.timeMin = SHOTS[1].time; S.cam.yaw = SHOTS[1].yaw * DEG; S.cam.pitch = SHOTS[1].pitch * DEG; }
+      buildUI(); setMode(S.mode);
       if (CFG.selftest) runSelftest();
+      if (CFG.bench) runBench();
       requestAnimationFrame(rafLoop);
     }
   } catch (e) {
