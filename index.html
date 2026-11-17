@@ -9,17 +9,23 @@
  ───────────────────────────────────────────────────────────────────────────
  §CSS        介面樣式
  §HTML       canvas、介面、錯誤與不支援說明
- §WGSL       著色器模組（每個模組一個 <script type="text/wgsl" id="…">）
-   common          每幀 uniform（Frame）、取樣器、雜湊與小工具
-   fullscreen      全螢幕三角形 vertex shader
-   sky_placeholder 骨架階段的暫用天空（M2 會換掉）
-   resolve         MSAA 自訂 resolve
-   post_final      曝光、AgX tone map、dithering、輸出到 canvas
+ §WGSL       著色器模組（每個模組一個 <script type="text/wgsl" id="…">，依檔案順序）
+   共用       common（uniform 結構、取樣器、雜湊）、fullscreen（全螢幕三角形）
+   大氣       atmo_fn、atmo_lut_fn、lut_trans、lut_ms、sky_lut_map、lut_sky、amb_cube
+   場景貼圖   scene_tex（group 1 共用貼圖）
+   分析模式   phys_fn（WGSL 版擴散模型）、heat_compute、heat_fn、curtain（剖面簾幕）
+   燈光       lights、lightmap_gen、flame
+   煙流       noise3d_gen、plume_fn、plume_tau、lightvol
+   天空地形   sky_fn、sky、terrain_gen、terrain_fn、lighting、terrain、water
+   設施       mesh_io、shadow、mesh
+   體積合成   vol_march、vol_temporal、vol_composite
+   後製       resolve（MSAA）、bloom_down、bloom_up、fxaa、post_final（AgX 與輸出）
  §J0  設定、查詢參數、畫質等級表
  §J1  數學工具
  §J2  物理模型（JavaScript double 參考實作）
  §J3  GPU 基礎建設：WGSL 前處理、binding 反射、pipeline、uniform buffer
  §J4  render target 與共用資源
+ §J5  場景生成：配置、地形（§J5b 程序網格、§J5c 煙流查表、§J5d 熱圖參數）
  §J6  各個 pass
  §J7  相機與輸入
  §J8  介面
@@ -3574,7 +3580,6 @@ const nice125 = (v) => { const e = Math.pow(10, Math.floor(Math.log10(v))), m = 
 function buildHeatResources() {
   const U = GPUTextureUsage;
   HEAT.tex = device.createTexture({label: 'heatTex', size: [HEAT.size, HEAT.size], format: 'r32float', usage: U.STORAGE_BINDING | U.TEXTURE_BINDING | U.COPY_SRC});
-  GPU.tex.push(HEAT.tex);
   RES.heatTex = RES.heatOut = HEAT.tex.createView();
   HEAT.dirty = true;
 }
@@ -4056,6 +4061,10 @@ function selftestCPU() {
   const s = PHYS.sigma('D', false, 1000);
   chk('a1', 'σy（D 級、鄉村、x=1000 m）[m]', s.sy, 76.28, 0.005);
   chk('a2', 'σz（D 級、鄉村、x=1000 m）[m]', s.sz, 37.95, 0.005);
+  // a3 Briggs 最終浮升（F≥55、浮力主導）。手算：F = g·vs·d²/4·ΔT/Ts = 277.33 m⁴/s³，
+  // 煙囪口風速 u = 3.5·(250/10)^0.25 = 7.826 m/s，Δh = 38.71·F^0.6/u = 144.58 m
+  const r3 = PHYS.rise({u10: 3.5, cls: 'D', urban: true, Ts: 55, Ta: 26, vs: 20, d: 8}, 250);
+  chk('a3', 'Briggs 最終浮升（Ts=55 °C、Ta=26 °C、vs=20 m/s、d=8 m、250 m 煙囪）[m]', r3.dhF, 144.58, 0.005);
   const c1 = PHYS.gauss(100, 5, s.sy, s.sz, 0, 0, 100);
   chk('b', '地面中心線濃度（Q=100 g/s、u=5 m/s、H=100 m）[μg/m³]', c1 * 1e6, 68.29, 0.005);
   // c 質量守恆：∫∫ u·C dy dz，y 取 ±8σy，z 取 0 到 H+8σz，中點法
@@ -4094,23 +4103,32 @@ async function runBench() {
   await new Promise(r => setTimeout(r, 1500));
   LOOP.manual = true; TIMER.active = true; TIMER.acc = {}; TIMER.n = 0;
   S.renderScale = 1; S.userActed = true; S.frozen = false; S.tour = null;
-  const y0 = heightAt(2750, -150) + 22, times = [], t0 = performance.now();
-  let last = t0;
-  while (performance.now() - t0 < 20000 && GPU.ready) {
-    const s = (performance.now() - t0) / 20000, k = s * s * (3 - 2 * s);
-    S.cam.pos = v3.lerp([2750, y0, -150], [900, 210, -520], k); S.cam.yaw = lerp(270, 248, k) * DEG; S.cam.pitch = lerp(-1, -7, k) * DEG; S.cam.fov = S.cam.fovTarget = lerp(24, 50, k) * DEG;
-    S.cam.vel = [0, 0, 0]; S.simTime += 1 / 60; S.modeK = 0;
-    render();
-    await device.queue.onSubmittedWorkDone();
-    const n = performance.now(); times.push(n - last); last = n;
+  try {
+    const y0 = heightAt(2750, -150) + 22, times = [], t0 = performance.now();
+    let last = t0;
+    while (performance.now() - t0 < 20000 && GPU.ready) {
+      const s = (performance.now() - t0) / 20000, k = s * s * (3 - 2 * s);
+      S.cam.pos = v3.lerp([2750, y0, -150], [900, 210, -520], k); S.cam.yaw = lerp(270, 248, k) * DEG; S.cam.pitch = lerp(-1, -7, k) * DEG; S.cam.fov = S.cam.fovTarget = lerp(24, 50, k) * DEG;
+      S.cam.vel = [0, 0, 0]; S.simTime += 1 / 60; S.modeK = 0;
+      render();
+      await device.queue.onSubmittedWorkDone();
+      const n = performance.now(); times.push(n - last); last = n;
+    }
+    const t = times.slice(20).sort((a, b) => a - b);
+    if (!t.length) {   // 太慢（例如軟體渲染）或中途 device lost：20 秒內不到 21 幀，無法統計
+      window.__bench = {error: '幀數不足，無法統計', frames: times.length, tier: TIER.name, adapter: GPU.adapterName, software: GPU.software};
+      console.log('BENCH ' + JSON.stringify(window.__bench));
+      return;
+    }
+    const avg = t.reduce((a, b) => a + b, 0) / t.length, p95 = t[Math.floor(t.length * 0.95)], passes = {};
+    for (const k in TIMER.acc) passes[k] = +(TIMER.acc[k] / Math.max(TIMER.n, 1)).toFixed(3);
+    const gpuTotal = +Object.values(passes).reduce((a, b) => a + b, 0).toFixed(2);
+    window.__bench = {frames: t.length, avgMs: +avg.toFixed(2), p95Ms: +p95.toFixed(2), fps: +(1000 / avg).toFixed(1), resolution: [RT.w, RT.h], canvas: [canvas.width, canvas.height],
+      tier: TIER.name, adapter: GPU.adapterName, renderer: GPU.glName, software: GPU.software, timestampQuery: TIMER.ok, gpuPassMs: passes, gpuPassTotalMs: gpuTotal, timedFrames: TIMER.n};
+    console.log('BENCH ' + JSON.stringify(window.__bench));
+  } finally {
+    TIMER.active = false; LOOP.manual = false; S.resetDt = true;   // 出錯也要把主迴圈交回去，否則畫面停住
   }
-  const t = times.slice(20).sort((a, b) => a - b), avg = t.reduce((a, b) => a + b, 0) / t.length, p95 = t[Math.floor(t.length * 0.95)], passes = {};
-  for (const k in TIMER.acc) passes[k] = +(TIMER.acc[k] / Math.max(TIMER.n, 1)).toFixed(3);
-  const gpuTotal = +Object.values(passes).reduce((a, b) => a + b, 0).toFixed(2);
-  window.__bench = {frames: t.length, avgMs: +avg.toFixed(2), p95Ms: +p95.toFixed(2), fps: +(1000 / avg).toFixed(1), resolution: [RT.w, RT.h], canvas: [canvas.width, canvas.height],
-    tier: TIER.name, adapter: GPU.adapterName, renderer: GPU.glName, software: GPU.software, timestampQuery: TIMER.ok, gpuPassMs: passes, gpuPassTotalMs: gpuTotal, timedFrames: TIMER.n};
-  console.log('BENCH ' + JSON.stringify(window.__bench));
-  TIMER.active = false; LOOP.manual = false; S.resetDt = true;
 }
 async function runSelftest() {
   const res = selftestCPU();
@@ -4206,10 +4224,15 @@ async function buildAll() {
   allocTargets();
   GPU.ready = true; S.resetDt = true;
 }
+// 重建要排隊：上一次還在等 GPU 回讀時又重建，會把它正在用的 buffer 釋放掉
+let rebuildQueue = Promise.resolve();
 async function setQuality(name) {
-  if (!TIERS[name] || name === TIER.name) return;
-  S.forceTier = name; S.renderScale = 1;
-  try { await buildAll(); } catch (e) { reportError('[setQuality] ' + (e.stack || e)); }
+  if (!Object.hasOwn(TIERS, name)) return;
+  S.forceTier = name;
+  // 排隊期間又被改選就跳過；只重建最後選的、而且和目前不同的等級
+  rebuildQueue = rebuildQueue.then(() => S.forceTier === name && name !== TIER.name ? (S.renderScale = 1, buildAll()) : null)
+    .catch(e => reportError('[setQuality] ' + (e.stack || e)));
+  await rebuildQueue;
   syncUI();
 }
 async function start(isRestart) {
@@ -4233,7 +4256,6 @@ async function start(isRestart) {
     fail('啟動時發生錯誤，畫面無法顯示。<br>請改用最新版的 Chrome 或 Edge，或 Safari 26 以上的版本。', String(e && e.message || e));
   }
 }
-new ResizeObserver(() => { S.resizePending = true; }).observe(canvas);
 start(false);
 </script>
 </body>
