@@ -2606,7 +2606,7 @@ async function initGPU() {
 // ═══ §J4 render target 與共用資源 ═════════════════════════════════════
 function pickTier() {
   if (S.forceTier && TIERS[S.forceTier]) return TIERS[S.forceTier];
-  if (CFG.q && TIERS[CFG.q]) return TIERS[CFG.q];
+  if (CFG.q && Object.hasOwn(TIERS, CFG.q)) return TIERS[CFG.q];   // 只認 TIERS 自己的鍵，擋掉 ?q=constructor 這類原型屬性
   if (CFG.shot) return TIERS.high;
   const ua = navigator.userAgent, name = (GPU.adapterName + ' ' + GPU.glName).toLowerCase();
   const mobile = /Android|iPhone|iPad|Mobile/i.test(ua) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(ua));

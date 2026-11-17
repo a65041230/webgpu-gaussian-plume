@@ -7,6 +7,7 @@
 - 測試瀏覽器：Playwright MCP 的 Chrome 157。`navigator.gpu` 存在；adapter vendor＝nvidia、architecture＝turing，WebGL 字串是「NVIDIA GeForce GTX 1650 … Direct3D11」，`isFallbackAdapter=false`，不是 SwiftShader。
 - 可用功能：`timestamp-query`、`float32-filterable`、`shader-f16` 都有；canvas 偏好格式 `bgra8unorm`。
 - 本機只有一張顯示卡（NVIDIA GeForce GTX 1650，沒有列出內顯）。
+- GitHub：私人 repo `a65041230/harbor-plume`（2026-11-17 第一次 push）。commit 身分只在這個 repo 設成 GitHub 的 noreply 信箱；電腦的全域 git 設定會帶本名和電腦名稱，不要用。之後每次 push 前都要先問使用者。
 
 ## 測試流程的注意事項
 - **Playwright 的視窗是最小化的**：`requestAnimationFrame` 每秒只有 1–2 次。程式裡有計時器備援（`LOOP.starved`），所以畫面照樣會跑，但 rAF 量到的幀率沒有意義，效能要看 `?bench=1` 的「等 GPU 做完」量法和 timestamp-query。
@@ -21,9 +22,9 @@
 - [x] M3 地形（GPU 產生高度圖 → 回讀 → clipmap＋morph）、水面
 - [x] M4 設施（程序網格＋instancing＋程序材質）、cascaded shadow maps
 - [x] M5 體積煙流（密度函式、光學深度體積、raymarch、時間累積、合成）、大氣霧、bloom
-- [ ] M6 夜間燈光 sprite、地面光池、火炬火焰
-- [ ] M7 分析模式（compute 熱圖、等值線、測站、Cmax、剖面簾幕）、UI 面板、selftest e
-- [ ] M8 平面反射、畫質分級＋動態解析度、手機操作、bench、FXAA
+- [x] M6 夜間燈光 sprite、地面光池、火炬火焰
+- [x] M7 分析模式（compute 熱圖、等值線、測站、Cmax、剖面簾幕）、UI 面板、selftest e
+- [ ] M8 平面反射、畫質分級＋動態解析度、手機操作、bench、FXAA（都做了；bench 還沒實際跑過）
 - [ ] 評審迴圈（最多 6 輪）
 - [ ] P1、P2
 - [ ] README、Artifact、最終報告
